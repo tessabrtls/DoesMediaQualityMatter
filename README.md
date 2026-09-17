@@ -39,8 +39,7 @@ output/
 codebook/          Variable definitions, coding rules, construction steps
 ```
 
-Scripts run in the order of their prefix. Each writes the objects the next one
-reads; none of them can be run in isolation.
+Scripts run in the order of their prefix.
 
 ## Reproducing the analysis
 
