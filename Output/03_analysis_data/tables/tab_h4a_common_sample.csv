@@ -1,0 +1,10 @@
+Topic,Variant,Own sample,p (own),N (own),Common sample,p (common),N (common)
+Cannabis,news,0.379,0.103,468,0.397,0.089,467
+Cannabis,news_corrected,0.133,0.536,536,0.071,0.758,467
+Cannabis,overall,-0.316,0.131,554,-0.309,0.184,467
+Child support,news,-0.485,0.031,465,-0.487,0.031,463
+Child support,news_corrected,-0.331,0.121,528,-0.381,0.095,463
+Child support,overall,-0.007,0.971,547,-0.147,0.517,463
+Energy transition,news,0.176,0.442,467,0.172,0.454,466
+Energy transition,news_corrected,-0.169,0.429,531,-0.134,0.56,466
+Energy transition,overall,-0.225,0.281,549,-0.209,0.365,466

@@ -1,0 +1,19 @@
+Topic,Variant,Group,Estimate,SE,CI low,CI high,p,Sig,N,adj. R2
+Cannabis,news,low,1.771,1.901,-2.143,5.686,0.36,,37,0.008
+Cannabis,news,high,-4.201,3.716,-12.04,3.638,0.274,,28,-0.261
+Cannabis,news_corrected,low,-2.109,1.878,-6.054,1.837,0.276,,30,0.075
+Cannabis,news_corrected,high,1.147,1.686,-2.278,4.572,0.501,,46,0.185
+Cannabis,overall,low,-0.52,1.867,-4.344,3.305,0.783,,40,-0.142
+Cannabis,overall,high,1.505,1.545,-1.683,4.694,0.34,,36,0.069
+Child support,news,low,2.201,1.361,-0.629,5.032,0.121,,33,0.411
+Child support,news,high,0.841,0.997,-1.198,2.88,0.406,,41,0.118
+Child support,news_corrected,low,2.531,1.11,0.217,4.846,0.034,*,31,0.283
+Child support,news_corrected,high,0.457,1.096,-1.764,2.677,0.679,,49,0.136
+Child support,overall,low,1.081,1.206,-1.393,3.555,0.378,,39,0.208
+Child support,overall,high,0.417,1.03,-1.688,2.523,0.688,,41,0.295
+Energy transition,news,low,0.258,NA,NA,NA,NA,,11,NA
+Energy transition,news,high,2.836,NA,NA,NA,NA,,10,NA
+Energy transition,news_corrected,low,-8.448,NA,NA,NA,NA,,7,NA
+Energy transition,news_corrected,high,-1.732,2.515,-9.736,6.272,0.541,,15,-0.419
+Energy transition,overall,low,43.877,NA,NA,NA,NA,,11,NA
+Energy transition,overall,high,9.626,NA,NA,NA,NA,,11,NA

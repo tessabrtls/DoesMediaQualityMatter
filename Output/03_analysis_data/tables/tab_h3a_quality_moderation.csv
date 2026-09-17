@@ -1,0 +1,19 @@
+Topic,Variant,Term,Estimate,SE,CI low,CI high,p,Sig,N,adj. R2
+Cannabis,news,Low group (b1),0.78,1.641,-2.513,4.074,0.636,,65,-0.011
+Cannabis,news,Interaction (b3),-2.251,3.04,-8.354,3.853,0.463,,65,-0.011
+Cannabis,news_corrected,Low group (b1),-1.266,1.806,-4.876,2.343,0.486,,76,-0.006
+Cannabis,news_corrected,Interaction (b3),2.697,2.353,-2.006,7.401,0.256,,76,-0.006
+Cannabis,overall,Low group (b1),-0.326,1.503,-3.331,2.679,0.829,,76,-0.003
+Cannabis,overall,Interaction (b3),0.893,2.144,-3.393,5.178,0.679,,76,-0.003
+Child support,news,Low group (b1),1.888,1.186,-0.484,4.26,0.117,,74,0.209
+Child support,news,Interaction (b3),-1.384,1.724,-4.834,2.065,0.425,,74,0.209
+Child support,news_corrected,Low group (b1),1.868,1.229,-0.586,4.323,0.133,,80,0.155
+Child support,news_corrected,Interaction (b3),-1.227,1.596,-4.413,1.96,0.445,,80,0.155
+Child support,overall,Low group (b1),0.978,1.137,-1.292,3.249,0.393,,80,0.146
+Child support,overall,Interaction (b3),0.231,1.628,-3.019,3.481,0.888,,80,0.146
+Energy transition,news,Low group (b1),0.831,6.834,-15.329,16.991,0.907,,21,-0.433
+Energy transition,news,Interaction (b3),6.883,9.107,-14.651,28.417,0.474,,21,-0.433
+Energy transition,news_corrected,Low group (b1),17.779,5.103,6.012,29.546,0.008,**,22,0.387
+Energy transition,news_corrected,Interaction (b3),-17.994,6.223,-32.345,-3.643,0.02,*,22,0.387
+Energy transition,overall,Low group (b1),7.124,7.426,-10.001,24.249,0.366,,22,-0.62
+Energy transition,overall,Interaction (b3),-2.886,10.071,-26.11,20.339,0.782,,22,-0.62

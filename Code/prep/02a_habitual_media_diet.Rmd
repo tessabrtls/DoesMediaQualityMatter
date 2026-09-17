@@ -1,0 +1,1192 @@
+---
+title: "Habitual Media Diet: Level and Diversity Across Diet Definitions and Tracking Channels"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+Builds pre-treatment measures of habitual media-diet quality and
+diversity. Every construction step and every diagnostic runs once per
+combination of **tracking channel** and **diet definition**, so no logic
+is duplicated across variants and any difference between them reflects
+the data rather than an inconsistency between copy-pasted blocks.
+
+Five things, in this order:
+
+1.  Fix a participant-specific reference date and a 30-day baseline
+    window
+2.  Build level and diversity for every channel x diet combination
+3.  Add descriptive median splits, computed within each combination
+4.  Produce faceted plots and five design diagnostics across all
+    combinations
+5.  Compare the diet definitions on coverage, variance, stability and
+    sparsity
+
+## Two registries define everything below
+
+**Tracking channel.** This replaces the previous second script, which
+was a full copy of this one differing in a single filter.
+
+| Channel key | Rule | Purpose |
+|------------------------|------------------------|------------------------|
+| `with_apps` | All visit types | Primary measure; app traffic folded into publisher domains in `01d` |
+| `without_apps` | `visit_type != 2` | Robustness: does app-derived traffic drive the picture |
+
+**Diet definition.** The original `is_news` is never overwritten;
+`is_news_corrected` reflects the manual domain review from `01e`.
+
+| Variant key | Visit filter | Main use |
+|------------------------|------------------------|------------------------|
+| `overall` | `pc1` available, no news restriction | Broad information-diet description |
+| `news` | `is_news == TRUE` | Sensitivity check on the automated classification |
+| `news_corrected` | `is_news_corrected == TRUE` | Primary news-specific measure |
+
+All six combinations share the same reference date, window, activity
+rule and weighting logic. Only the visit-level filter differs.
+
+## Level and diversity
+
+Level is the duration-weighted mean PC1 score: the average quality of a
+participant's scored sources. Diversity is the duration-weighted
+standard deviation: how heterogeneous those sources are in quality. Two
+people can share an average and differ sharply in diversity, one using
+mid-quality sources consistently, the other alternating between high and
+low. The distinction follows media-diet work that treats the average
+position of a diet and its internal heterogeneity as separate constructs
+(Padro-Solanet & Balcells, 2022).
+
+## Design choices
+
+| Choice | Rule | Reason |
+|------------------------|------------------------|------------------------|
+| Reference date | Day before each participant's earliest search task | Guarantees the baseline precedes that participant's first exposure |
+| Baseline window | 30 calendar days | Recent and comparable; checked against full history in Diagnostic B |
+| Activity threshold | At least 7 active days, counted on *all* baseline visits | Avoids treating sparse observation as habitual behaviour; the threshold describes overall browsing, not diet-specific browsing |
+| Weighting | Visit duration | Longer visits contribute more |
+| Diversity requirement | At least 2 distinct PC1 values | A spread statistic is not meaningful for a single score |
+| Median splits | Computed within each channel x variant | The combinations have different distributions and different available samples |
+
+## Outputs
+
+| Output | Level | Purpose |
+|------------------------|------------------------|------------------------|
+| `<channel_dir>/habitual_media_diet_FINAL.csv` | Participant (wide) | Variant-prefixed columns, one file per channel, read by `03b`--`03e` |
+| `habitual_media_diet_long.csv` | Participant x channel x variant | Long format for plots and comparison |
+| `MAIN_plot_*.png` | Faceted channel x variant | Core descriptive plots |
+| `diagnostics/diagnostic_*.csv`, `diag*.png` | Participant / visit | Design checks A--E |
+| `habitual_media_diet_variant_comparison.csv` | Channel x variant | Side-by-side comparison table |
+
+In the wide file every measure carries a `hab_` prefix and its variant
+key, for example `hab_news_corrected_dw_pc1`. The prefix marks the
+measurement period: `hab_` for pre-treatment habitual measures built
+here, `exp_` for experimental-period exposures built in `03a`. Keeping
+the two families disjoint is what prevents the join collision documented
+in Appendix G. In the long file the names stay generic, with `channel`
+and `variant` columns carrying the keys.
+
+# Part 1: Setup
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(readr)
+library(tibble)
+```
+
+
+```{r paths-config-data, include = FALSE}
+
+data_dir     <- "~/Desktop/Masterarbeit/Data"
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+
+```
+
+```{r paths-config}
+#project_root <- "DoesMediaQualityMatter"
+#data_dir     <- ""
+input_dir  <- file.path(project_root, "Output", "01_visits")
+output_dir <- file.path(project_root, "Output", "02_media_quality")
+
+# One directory per tracking channel, matching the existing folder names so
+# downstream paths stay valid.
+channel_dirs <- c(
+  with_apps    = file.path(output_dir, "habitual_media_diet_baseline"),
+  without_apps = file.path(output_dir, "habitual_media_diet_baseline_without_apps")
+)
+diagnostics_dir <- file.path(channel_dirs[["with_apps"]], "diagnostics")
+
+walk(c(channel_dirs, diagnostics_dir), dir.create, showWarnings = FALSE, recursive = TRUE)
+
+attitude_paths <- file.path(data_dir,
+                            c("df1_final_ac.Rdata", "df2_final_ac.Rdata", "df3_final_ac.Rdata"))
+```
+
+```{r constants}
+BASELINE_WINDOW_DAYS    <- 30
+MIN_ACTIVE_DAYS         <- 7
+MIN_ACTIVE_DAYS_FULL    <- 20
+MIN_DISTINCT_PC1_FOR_SD <- 2
+
+DATA_COLLECTION_START <- as.Date("2023-04-01")
+WAVE1_START_FIXED     <- as.Date("2023-06-12")
+```
+
+## Inputs
+
+| Input | Level | Required variables |
+|------------------------|------------------------|------------------------|
+| `visits_final.Rds` | Visit | `pid`, `used_date`, `content_id`, `duration`, `visit_type`, `pc1`, `is_news`, `is_news_corrected` |
+| `df1`--`df3_final_ac.Rdata` | Wave | `pid`, `start_time`, `sources_used` |
+
+```{r load-inputs}
+visits <- readRDS(file.path(input_dir, "visits_final.Rds")) %>%
+  mutate(
+    pid = as.character(pid),
+    used_date = as.Date(used_date),
+    content_id = as.character(content_id),
+    duration = as.numeric(duration),
+    pc1 = as.numeric(pc1),
+    is_news = as.logical(is_news),
+    is_news_corrected = as.logical(is_news_corrected)
+  )
+
+waves <- map(attitude_paths, function(p) {
+  e <- new.env(); load(p, envir = e)
+  get(ls(e)[1], envir = e) %>%
+    mutate(pid = as.character(as.numeric(pid)),
+           search_start = as.POSIXct(start_time, format = "%Y-%m-%d %H:%M:%S", tz = "Europe/Berlin"))
+})
+
+tibble(
+  visit_rows        = nrow(visits),
+  participants      = n_distinct(visits$pid),
+  with_pc1          = sum(!is.na(visits$pc1)),
+  is_news           = sum(visits$is_news, na.rm = TRUE),
+  is_news_corrected = sum(visits$is_news_corrected, na.rm = TRUE),
+  app_rows          = sum(visits$visit_type == 2L, na.rm = TRUE)
+)
+```
+
+## Registries
+
+The single place where the six combinations are defined. Everything
+below loops over `analysis_grid` rather than repeating code per
+combination. `flag_col = NA` means no news filter.
+
+```{r registries}
+channel_variants <- tribble(
+  ~channel,        ~channel_label,           ~keep_apps,
+  "with_apps",     "All channels",           TRUE,
+  "without_apps",  "Web and mobile web only", FALSE
+)
+
+diet_variants <- tribble(
+  ~variant,         ~flag_col,           ~variant_label,
+  "overall",        NA_character_,       "Overall scored diet",
+  "news",           "is_news",           "Automated news diet",
+  "news_corrected", "is_news_corrected", "Corrected news diet"
+)
+
+channel_levels <- channel_variants$channel
+variant_levels <- diet_variants$variant
+
+analysis_grid <- cross_join(channel_variants, diet_variants)
+
+# Visit-level data split by channel, used by every builder below.
+visits_by_channel <- set_names(
+  map(channel_variants$keep_apps, function(keep)
+    if (keep) visits else filter(visits, visit_type != 2L)),
+  channel_variants$channel)
+
+map_dfr(names(visits_by_channel), ~ tibble(channel = .x, visit_rows = nrow(visits_by_channel[[.x]])))
+```
+
+# Part 2: Reference Date and Baseline Window
+
+Each participant's baseline ends the day before their earliest recorded
+search task, which is what prevents post-treatment visits from entering
+a pre-treatment measure. The rule does not depend on channel or diet
+variant.
+
+```{r reference-date}
+pid_wave_search <- map_dfr(seq_along(waves), ~ waves[[.x]] %>%
+                             transmute(pid, wave = .x, search_start)) %>%
+  filter(!is.na(search_start)) %>%
+  distinct(pid, wave, .keep_all = TRUE)
+
+pid_windows <- pid_wave_search %>%
+  group_by(pid) %>%
+  summarise(reference_date = as.Date(min(search_start)) - 1, .groups = "drop") %>%
+  mutate(window_start = reference_date - (BASELINE_WINDOW_DAYS - 1))
+
+visits_baseline <- map(visits_by_channel, function(v)
+  v %>% inner_join(pid_windows, by = "pid") %>%
+    filter(used_date >= window_start, used_date <= reference_date))
+
+map_dfr(names(visits_baseline), ~ tibble(
+  channel = .x,
+  baseline_rows = nrow(visits_baseline[[.x]]),
+  participants = n_distinct(visits_baseline[[.x]]$pid)))
+```
+
+Descriptive only, used in no calculation: whether a participant reported
+using any source during a search task.
+
+```{r used-any-source}
+pid_used_any_source <- map_dfr(seq_along(waves), ~ waves[[.x]] %>%
+                                 transmute(pid, wave = .x, sources_used)) %>%
+  distinct(pid, wave, .keep_all = TRUE) %>%
+  group_by(pid) %>%
+  summarise(used_any_source = if (all(is.na(sources_used))) NA
+            else any(sources_used == 1, na.rm = TRUE), .groups = "drop")
+```
+
+# Part 3: Constructing the Diet Measures
+
+```{r weighting-helpers}
+weighted_mean_na <- function(x, w) {
+  keep <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  sum(x[keep] * w[keep]) / sum(w[keep])
+}
+
+weighted_sd_na <- function(x, w) {
+  keep <- !is.na(x) & !is.na(w) & w > 0
+  x <- x[keep]; w <- w[keep]
+  if (length(unique(x)) < MIN_DISTINCT_PC1_FOR_SD || sum(w) == 0) return(NA_real_)
+  m <- sum(x * w) / sum(w)
+  sqrt(sum(w * (x - m)^2) / sum(w))
+}
+
+# Subsets to a diet variant's visits and computes the five core statistics.
+# Called once per grid row, so all six combinations share identical logic.
+build_variant_activity <- function(flag_col, visits_df) {
+  if (!is.na(flag_col)) visits_df <- visits_df[visits_df[[flag_col]] %in% TRUE, , drop = FALSE]
+
+  visits_df %>%
+    group_by(pid) %>%
+    summarise(
+      n_rows_with_pc1          = sum(!is.na(pc1)),
+      n_distinct_pc1           = n_distinct(pc1[!is.na(pc1)]),
+      pc1_duration             = sum(duration[!is.na(pc1)], na.rm = TRUE),
+      duration_weighted_pc1    = weighted_mean_na(pc1, duration),
+      duration_weighted_sd_pc1 = weighted_sd_na(pc1, duration),
+      .groups = "drop"
+    )
+}
+```
+
+Active days, row counts and total duration describe overall baseline
+browsing and so depend on the channel but not on the diet variant. They
+gate every variant's availability through the activity threshold.
+
+```{r general-activity}
+general_activity <- map_dfr(names(visits_baseline), ~ visits_baseline[[.x]] %>%
+  group_by(pid) %>%
+  summarise(n_active_days = n_distinct(used_date), n_rows = n(),
+            total_duration = sum(duration, na.rm = TRUE), .groups = "drop") %>%
+  mutate(channel = .x))
+```
+
+A participant absent from a combination's activity table had zero
+qualifying visits for that combination, not a missing observation. The
+cross join below makes those structural zeros explicit before the
+coalesce.
+
+```{r build-all-combinations}
+habitual_long <- analysis_grid %>%
+  mutate(activity = map2(flag_col, channel,
+                         ~ build_variant_activity(.x, visits_baseline[[.y]]))) %>%
+  dplyr::select(channel, channel_label, variant, variant_label, activity) %>%
+  unnest(activity)
+
+habitual_long <- pid_windows %>%
+  dplyr::select(pid) %>%
+  cross_join(analysis_grid %>%
+               dplyr::select(channel, channel_label, variant, variant_label)) %>%
+  left_join(habitual_long, by = c("pid", "channel", "channel_label", "variant", "variant_label")) %>%
+  left_join(general_activity, by = c("pid", "channel")) %>%
+  left_join(pid_used_any_source, by = "pid") %>%
+  mutate(
+    across(c(n_active_days, n_rows, n_rows_with_pc1, n_distinct_pc1), ~ coalesce(.x, 0L)),
+    across(c(total_duration, pc1_duration), ~ coalesce(.x, 0)),
+    share_active_days = n_active_days / BASELINE_WINDOW_DAYS,
+    meets_activity_threshold = n_active_days >= MIN_ACTIVE_DAYS,
+    duration_weighted_pc1    = if_else(meets_activity_threshold, duration_weighted_pc1, NA_real_),
+    duration_weighted_sd_pc1 = if_else(meets_activity_threshold, duration_weighted_sd_pc1, NA_real_),
+    channel = factor(channel, levels = channel_levels),
+    variant = factor(variant, levels = variant_levels)
+  )
+
+cat("Rows (participants x channels x variants):", nrow(habitual_long), "\n")
+```
+
+## Coverage across combinations
+
+```{r measure-coverage}
+measure_coverage <- habitual_long %>%
+  group_by(channel, channel_label, variant, variant_label) %>%
+  summarise(
+    participants           = n(),
+    meets_activity         = sum(meets_activity_threshold),
+    level_available        = sum(!is.na(duration_weighted_pc1)),
+    diversity_available    = sum(!is.na(duration_weighted_sd_pc1)),
+    median_n_rows_with_pc1 = median(n_rows_with_pc1),
+    .groups = "drop"
+  )
+
+measure_coverage
+write_csv(measure_coverage, file.path(channel_dirs[["with_apps"]],
+                                      "habitual_media_diet_measure_coverage.csv"))
+```
+
+# Part 4: Descriptive Median Splits
+
+Median splits are descriptive only; the continuous level and diversity
+measures remain the preferred variables for confirmatory models. Medians
+are computed within each channel x variant, since the combinations
+differ in both distribution and available sample.
+
+```{r subgroup-splits}
+habitual_long <- habitual_long %>%
+  group_by(channel, variant) %>%
+  mutate(
+    median_duration_weighted_pc1    = median(duration_weighted_pc1, na.rm = TRUE),
+    median_duration_weighted_sd_pc1 = median(duration_weighted_sd_pc1, na.rm = TRUE),
+    habitual_diet = case_when(
+      is.na(duration_weighted_pc1) ~ NA_character_,
+      duration_weighted_pc1 <= median_duration_weighted_pc1 ~ "low",
+      TRUE ~ "high"),
+    habitual_diversity = case_when(
+      is.na(duration_weighted_sd_pc1) ~ NA_character_,
+      duration_weighted_sd_pc1 <= median_duration_weighted_sd_pc1 ~ "low",
+      TRUE ~ "high"),
+    habitual_diet_diversity_group = if_else(
+      is.na(habitual_diet) | is.na(habitual_diversity), NA_character_,
+      paste0(habitual_diet, "_level-", habitual_diversity, "_diversity"))
+  ) %>%
+  ungroup()
+
+count(habitual_long, channel, variant, habitual_diet_diversity_group) %>%
+  pivot_wider(names_from = habitual_diet_diversity_group, values_from = n, values_fill = 0L)
+```
+
+# Part 5: Saving
+
+The long file carries both channels. The wide files are written one per
+channel into that channel's own directory, keeping the variant-prefixed
+column names that downstream scripts expect.
+
+Column names carry the measurement period as a prefix. Every habitual
+column starts with `hab_`, every experimental-period column built in
+`03a` starts with `exp_`. This is not cosmetic: the two families
+previously shared names, so a join produced silent `.x` / `.y` suffixes
+and a pre-treatment measure could be used where an experimental-period
+exposure was intended (Appendix G). With disjoint prefixes the collision
+cannot occur, and a model formula is readable without tracing the join
+history.
+
+| Generic name in the long file | Wide name, e.g. variant `news_corrected` |
+|------------------------------------|------------------------------------|
+| `duration_weighted_pc1` | `hab_news_corrected_dw_pc1` |
+| `duration_weighted_sd_pc1` | `hab_news_corrected_dw_sd_pc1` |
+| `habitual_diet` | `hab_news_corrected_level_group` |
+| `habitual_diversity` | `hab_news_corrected_diversity_group` |
+| `habitual_diet_diversity_group` | `hab_news_corrected_level_diversity_group` |
+
+```{r save-final}
+write_csv(habitual_long, file.path(channel_dirs[["with_apps"]], "habitual_media_diet_long.csv"))
+
+# Generic long-format name -> stem used in the wide file.
+wide_stems <- c(
+  duration_weighted_pc1           = "dw_pc1",
+  duration_weighted_sd_pc1        = "dw_sd_pc1",
+  habitual_diet                   = "level_group",
+  habitual_diversity              = "diversity_group",
+  habitual_diet_diversity_group   = "level_diversity_group",
+  median_duration_weighted_pc1    = "median_dw_pc1",
+  median_duration_weighted_sd_pc1 = "median_dw_sd_pc1",
+  n_rows_with_pc1                 = "n_rows_with_pc1",
+  n_distinct_pc1                  = "n_distinct_pc1",
+  pc1_duration                    = "pc1_duration"
+)
+
+to_wide <- function(df) {
+  pieces <- df %>%
+    dplyr::select(pid, variant, all_of(names(wide_stems))) %>%
+    split(.$variant) %>%
+    imap(~ .x %>%
+           dplyr::select(-variant) %>%
+           rename_with(function(n) paste0("hab_", .y, "_", wide_stems[n]), -pid))
+
+  reduce(pieces, left_join, by = "pid") %>%
+    left_join(df %>% distinct(pid, n_active_days, n_rows, total_duration,
+                              share_active_days, meets_activity_threshold, used_any_source),
+              by = "pid")
+}
+
+walk(names(channel_dirs), function(ch) {
+  wide <- habitual_long %>% filter(channel == ch) %>% to_wide()
+
+  # Every measure column must carry the hab_ prefix. A column that does not is
+  # a candidate for a name collision downstream.
+  unprefixed <- setdiff(names(wide),
+                        c("pid", "n_active_days", "n_rows", "total_duration",
+                          "share_active_days", "meets_activity_threshold", "used_any_source"))
+  unprefixed <- unprefixed[!startsWith(unprefixed, "hab_")]
+  if (length(unprefixed) > 0) {
+    stop("Wide file for channel '", ch, "' has unprefixed measure columns: ",
+         paste(unprefixed, collapse = ", "))
+  }
+
+  write_csv(wide, file.path(channel_dirs[[ch]], "habitual_media_diet_FINAL.csv"))
+  cat(ch, ": wide file with", ncol(wide), "columns and", nrow(wide), "rows\n")
+})
+
+
+```
+
+# Part 6: Core Visualisations
+
+One figure per tracking channel, saved into that channel's own
+directory, with the three diet definitions faceted side by side inside
+each figure. Comparing the two channels means comparing two files rather
+than two rows of one grid, which keeps each figure at a size that can be
+dropped into the thesis without shrinking the panels.
+
+```{r plot-helper}
+# Draws one plot per channel and writes it into that channel's directory.
+# `plot_fun` receives the channel's subset of the data and its label.
+plot_by_channel <- function(data, plot_fun, name, width = 11, height = 4.5) {
+  for (ch in names(channel_dirs)) {
+    p <- plot_fun(data %>% filter(channel == ch),
+                  channel_variants$channel_label[channel_variants$channel == ch])
+    print(p)
+    ggsave(file.path(channel_dirs[[ch]], name), p, width = width, height = height)
+  }
+}
+
+variant_facets <- function() facet_wrap(~ variant_label, nrow = 1)
+```
+
+## Activity days
+
+Active days do not depend on the diet definition, so this plot is not
+faceted. It is included because the activity threshold gates every
+variant's availability.
+
+```{r plot-active-days, fig.width=7, fig.height=5}
+plot_by_channel(
+  habitual_long %>% distinct(pid, channel, n_active_days),
+  function(d, lab)
+    ggplot(d, aes(x = n_active_days)) +
+      geom_histogram(binwidth = 1, fill = "steelblue", alpha = 0.7) +
+      geom_vline(xintercept = MIN_ACTIVE_DAYS, linetype = "dashed", colour = "firebrick") +
+      labs(title = "Active days in the 30-day baseline window", subtitle = lab,
+           x = "Active days", y = "Participants") +
+      theme_minimal(),
+  "MAIN_plot_active_days.png", width = 7, height = 5)
+```
+
+## Level density
+
+```{r plot-level-density, fig.width=11, fig.height=4.5}
+plot_by_channel(
+  habitual_long %>% filter(!is.na(duration_weighted_pc1)),
+  function(d, lab)
+    ggplot(d, aes(x = duration_weighted_pc1, fill = variant_label)) +
+      geom_density(alpha = 0.6, show.legend = FALSE) + variant_facets() +
+      labs(title = "Habitual diet quality LEVEL", subtitle = lab,
+           x = "Duration-weighted PC1", y = "Density") +
+      theme_minimal(),
+  "MAIN_plot_level_density.png")
+```
+
+## Diversity density
+
+```{r plot-diversity-density, fig.width=11, fig.height=4.5}
+plot_by_channel(
+  habitual_long %>% filter(!is.na(duration_weighted_sd_pc1)),
+  function(d, lab)
+    ggplot(d, aes(x = duration_weighted_sd_pc1, fill = variant_label)) +
+      geom_density(alpha = 0.6, show.legend = FALSE) + variant_facets() +
+      labs(title = "Habitual diet quality DIVERSITY", subtitle = lab,
+           x = "Duration-weighted PC1 standard deviation", y = "Density") +
+      theme_minimal(),
+  "MAIN_plot_diversity_density.png")
+```
+
+## Level versus diversity
+
+```{r plot-level-vs-diversity, fig.width=12, fig.height=5}
+plot_by_channel(
+  habitual_long %>% filter(!is.na(duration_weighted_pc1), !is.na(duration_weighted_sd_pc1)),
+  function(d, lab)
+    ggplot(d, aes(x = duration_weighted_pc1, y = duration_weighted_sd_pc1,
+                  colour = habitual_diet_diversity_group)) +
+      geom_point(alpha = 0.5) +
+      geom_vline(aes(xintercept = median_duration_weighted_pc1),
+                 linetype = "dashed", colour = "grey40") +
+      geom_hline(aes(yintercept = median_duration_weighted_sd_pc1),
+                 linetype = "dashed", colour = "grey40") +
+      variant_facets() +
+      labs(title = "Level versus diversity", subtitle = lab,
+           x = "Duration-weighted PC1 level", y = "Duration-weighted PC1 diversity",
+           colour = "Descriptive 2x2 group") +
+      theme_minimal() + theme(legend.position = "bottom"),
+  "MAIN_plot_level_vs_diversity.png", width = 12, height = 5)
+```
+
+## 2x2 subgroup sizes
+
+```{r plot-2x2-sizes, fig.width=12, fig.height=4.5}
+plot_by_channel(
+  habitual_long %>% filter(!is.na(habitual_diet_diversity_group)),
+  function(d, lab)
+    ggplot(d, aes(x = habitual_diet_diversity_group)) +
+      geom_bar(fill = "steelblue") + variant_facets() +
+      labs(title = "2x2 subgroup sizes", subtitle = lab, x = NULL, y = "Participants") +
+      theme_minimal() + theme(axis.text.x = element_text(angle = 30, hjust = 1)),
+  "MAIN_plot_2x2_group_sizes.png", width = 12, height = 4.5)
+```
+
+## Coverage per definition
+
+Makes the missingness trade-off from the coverage table visible:
+restricting to news, then to corrected news, shrinks the number of
+participants with a usable score.
+
+```{r plot-coverage, fig.width=8, fig.height=5}
+plot_by_channel(
+  measure_coverage %>%
+    dplyr::select(channel, variant_label, level_available, diversity_available) %>%
+    pivot_longer(c(level_available, diversity_available),
+                 names_to = "measure", values_to = "n_participants") %>%
+    mutate(measure = recode(measure, level_available = "Level",
+                            diversity_available = "Diversity")),
+  function(d, lab)
+    ggplot(d, aes(x = variant_label, y = n_participants, fill = measure)) +
+      geom_col(position = "dodge") +
+      labs(title = "Participants with a usable score", subtitle = lab,
+           x = NULL, y = "Participants", fill = NULL) +
+      theme_minimal() + theme(axis.text.x = element_text(angle = 15, hjust = 1)),
+  "MAIN_plot_coverage.png", width = 8, height = 5)
+```
+
+# Part 7: Diagnostics
+
+Five design checks, each run for all six combinations rather than only
+for the primary one. Running them generically is what makes a
+combination-specific problem visible — for instance the news variants
+having too few active days to support a stable diversity estimate —
+instead of assumed away.
+
+| Diagnostic | Question |
+|------------------------------------|------------------------------------|
+| A | Does the individual reference date matter versus a shared pre-Wave-1 date? |
+| B | Does the 30-day window matter versus full history? |
+| C | Does duration weighting matter versus an unweighted mean? |
+| D | Is the level distribution skewed enough that median and mean diverge? |
+| E | Do qualifying participants actually show repeated source use? |
+
+## Generic builder
+
+Takes the same `flag_col` argument as the main construction step, plus a
+reference-date rule and a window rule, so A--C run once per combination
+x rule rather than being hard-coded to one variant.
+
+```{r diagnostics-builder}
+pid_reference_A <- pid_wave_search %>%
+  group_by(pid) %>%
+  summarise(reference_date = as.Date(min(search_start)) - 1, .groups = "drop")
+
+pid_reference_B <- tibble(pid = unique(pid_wave_search$pid),
+                          reference_date = WAVE1_START_FIXED - 1)
+
+pid_reference_lookup <- list(individual = pid_reference_A, fixed_pre_wave1 = pid_reference_B)
+
+window_start_rules <- list(
+  `30day` = function(ref) ref - (BASELINE_WINDOW_DAYS - 1),
+  full    = function(ref) rep(DATA_COLLECTION_START, length(ref))
+)
+
+build_variant_baseline <- function(flag_col, visits_df, pid_reference,
+                                   window_rule, min_active_days) {
+  windows <- pid_reference %>%
+    mutate(window_start = window_rule(reference_date),
+           window_days = as.numeric(reference_date - window_start) + 1)
+
+  visits_window <- visits_df %>%
+    inner_join(windows, by = "pid") %>%
+    filter(used_date >= window_start, used_date <= reference_date)
+
+  subset <- if (is.na(flag_col)) visits_window
+            else visits_window[visits_window[[flag_col]] %in% TRUE, , drop = FALSE]
+
+  activity <- subset %>%
+    group_by(pid) %>%
+    summarise(n_rows_with_pc1 = sum(!is.na(pc1)),
+              n_distinct_pc1 = n_distinct(pc1[!is.na(pc1)]),
+              duration_weighted_pc1 = weighted_mean_na(pc1, duration),
+              duration_weighted_sd_pc1 = weighted_sd_na(pc1, duration),
+              unweighted_pc1 = mean(pc1, na.rm = TRUE),
+              .groups = "drop")
+
+  # The threshold always counts ALL visits in the window, not the
+  # variant-filtered subset, consistent with the main construction step:
+  # "habitual" is defined by overall browsing activity.
+  all_active <- visits_window %>%
+    group_by(pid) %>% summarise(n_active_days = n_distinct(used_date), .groups = "drop")
+
+  windows %>%
+    dplyr::select(pid, window_days) %>%
+    left_join(all_active, by = "pid") %>%
+    left_join(activity, by = "pid") %>%
+    mutate(
+      across(c(n_active_days, n_rows_with_pc1, n_distinct_pc1), ~ coalesce(.x, 0L)),
+      meets_activity_threshold = n_active_days >= min_active_days,
+      across(c(duration_weighted_pc1, duration_weighted_sd_pc1, unweighted_pc1),
+             ~ if_else(meets_activity_threshold, .x, NA_real_))
+    )
+}
+```
+
+```{r diagnostics-build-grid}
+diag_rules <- tribble(
+  ~baseline_version,  ~window_type,  ~min_active_days,
+  "individual",       "30day",       MIN_ACTIVE_DAYS,
+  "individual",       "full",        MIN_ACTIVE_DAYS_FULL,
+  "fixed_pre_wave1",  "30day",       MIN_ACTIVE_DAYS,
+  "fixed_pre_wave1",  "full",        MIN_ACTIVE_DAYS_FULL
+)
+
+all_habitual <- cross_join(analysis_grid, diag_rules) %>%
+  mutate(result = pmap(list(flag_col, channel, baseline_version, window_type, min_active_days),
+    function(fc, ch, bv, wt, mad)
+      build_variant_baseline(fc, visits_by_channel[[ch]], pid_reference_lookup[[bv]],
+                             window_start_rules[[wt]], mad))) %>%
+  dplyr::select(channel, channel_label, variant, variant_label,
+                baseline_version, window_type, result) %>%
+  unnest(result) %>%
+  mutate(channel = factor(channel, levels = channel_levels),
+         variant = factor(variant, levels = variant_levels))
+
+write_csv(all_habitual, file.path(diagnostics_dir, "diagnostic_all_variants_versions.csv"))
+cat("Diagnostic rows (participants x 6 combinations x 4 rules):", nrow(all_habitual), "\n")
+```
+
+## A: reference date
+
+The individual date is preferred because it is the only rule that
+guarantees each participant's baseline precedes their own first search
+task. A high correlation shows that the choice does not materially
+change the measure.
+
+```{r diagnostic-a}
+all_habitual %>%
+  filter(window_type == "30day") %>%
+  dplyr::select(pid, channel, variant, baseline_version, duration_weighted_pc1) %>%
+  pivot_wider(names_from = baseline_version, values_from = duration_weighted_pc1) %>%
+  group_by(channel, variant) %>%
+  summarise(n = sum(complete.cases(individual, fixed_pre_wave1)),
+            r = round(cor(individual, fixed_pre_wave1, use = "complete.obs"), 3),
+            .groups = "drop")
+```
+
+## B: window length
+
+```{r diagnostic-b}
+agreement_30day_full <- all_habitual %>%
+  filter(baseline_version == "individual", window_type == "30day") %>%
+  dplyr::select(pid, channel, channel_label, variant, variant_label,
+                pc1_30day = duration_weighted_pc1) %>%
+  inner_join(all_habitual %>%
+               filter(baseline_version == "individual", window_type == "full") %>%
+               dplyr::select(pid, channel, variant, pc1_full = duration_weighted_pc1),
+             by = c("pid", "channel", "variant")) %>%
+  filter(!is.na(pc1_30day), !is.na(pc1_full))
+
+agreement_30day_full %>%
+  group_by(channel, variant) %>%
+  summarise(n = n(), r = round(cor(pc1_30day, pc1_full), 3), .groups = "drop")
+```
+
+```{r diagnostic-b-plot, fig.width=11, fig.height=4.5}
+plot_by_channel(
+  agreement_30day_full,
+  function(d, lab)
+    ggplot(d, aes(x = pc1_30day, y = pc1_full)) +
+      geom_point(alpha = 0.4) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "firebrick") +
+      variant_facets() +
+      labs(title = "Quality level: 30-day window versus full history", subtitle = lab,
+           x = "30-day duration-weighted PC1", y = "Full-history duration-weighted PC1") +
+      theme_minimal(),
+  "diagB_window_agreement.png")
+```
+
+## C: duration weighting
+
+```{r diagnostic-c}
+all_habitual %>%
+  filter(baseline_version == "individual", window_type == "30day") %>%
+  group_by(channel, variant) %>%
+  group_modify(function(df, ...) {
+    m <- df %>%
+      dplyr::select(unweighted_pc1, duration_weighted_pc1, duration_weighted_sd_pc1) %>%
+      filter(complete.cases(.))
+    if (nrow(m) < 3) return(tibble(note = "insufficient complete cases"))
+    as_tibble(round(cor(m), 3), rownames = "metric")
+  }) %>%
+  print(n = Inf)
+```
+
+## D: median versus mean
+
+```{r diagnostic-d}
+habitual_long %>%
+  group_by(channel, variant) %>%
+  summarise(across(c(duration_weighted_pc1, duration_weighted_sd_pc1),
+                   list(median = ~ round(median(.x, na.rm = TRUE), 4),
+                        mean   = ~ round(mean(.x, na.rm = TRUE), 4))),
+            .groups = "drop")
+```
+
+```{r diagnostic-d-plot, fig.width=11, fig.height=4.5}
+plot_by_channel(
+  habitual_long %>% filter(!is.na(duration_weighted_pc1)) %>%
+    group_by(channel, variant_label) %>%
+    mutate(med = median(duration_weighted_pc1), avg = mean(duration_weighted_pc1)) %>%
+    ungroup(),
+  function(d, lab)
+    ggplot(d, aes(x = duration_weighted_pc1)) +
+      geom_density(fill = "steelblue", alpha = 0.4) +
+      geom_vline(aes(xintercept = med), linetype = "dashed", colour = "firebrick") +
+      geom_vline(aes(xintercept = avg), linetype = "dotted", colour = "darkgreen") +
+      variant_facets() +
+      labs(title = "Median (dashed) versus mean (dotted) quality level", subtitle = lab,
+           x = "Duration-weighted PC1", y = "Density") +
+      theme_minimal(),
+  "diagD_median_vs_mean.png")
+```
+
+## E: repeated-source behaviour
+
+Computed within each combination's qualifying visits, so a repeat source
+for the news variant means a repeatedly visited news source, not a
+repeatedly visited domain in general.
+
+```{r diagnostic-e}
+compute_repeat_summary <- function(flag_col, visits_df) {
+  if (!is.na(flag_col)) visits_df <- visits_df[visits_df[[flag_col]] %in% TRUE, , drop = FALSE]
+
+  visits_df %>%
+    filter(!is.na(content_id)) %>%
+    count(pid, content_id, name = "n_visits_this_source") %>%
+    mutate(is_repeat_source = n_visits_this_source > 1) %>%
+    group_by(pid) %>%
+    summarise(n_distinct_sources = n(),
+              n_repeat_sources = sum(is_repeat_source),
+              share_repeat_visits = sum(n_visits_this_source[is_repeat_source]) /
+                                    sum(n_visits_this_source),
+              has_any_repeat_source = any(is_repeat_source),
+              .groups = "drop")
+}
+
+habitual_with_repeats <- analysis_grid %>%
+  mutate(repeats = map2(flag_col, channel,
+                        ~ compute_repeat_summary(.x, visits_baseline[[.y]]))) %>%
+  dplyr::select(channel, variant, repeats) %>%
+  unnest(repeats) %>%
+  right_join(habitual_long %>%
+               dplyr::select(pid, channel, channel_label, variant, variant_label,
+                             meets_activity_threshold),
+             by = c("pid", "channel", "variant")) %>%
+  mutate(across(c(n_distinct_sources, n_repeat_sources), ~ coalesce(.x, 0L)),
+         share_repeat_visits = coalesce(share_repeat_visits, 0),
+         has_any_repeat_source = coalesce(has_any_repeat_source, FALSE))
+
+write_csv(habitual_with_repeats,
+          file.path(diagnostics_dir, "diagnostic_repeat_visits_all_variants.csv"))
+
+qualifying <- habitual_with_repeats %>% filter(meets_activity_threshold)
+
+qualifying %>%
+  group_by(channel, variant) %>%
+  summarise(n_qualifying = n(),
+            n_with_repeat_source = sum(has_any_repeat_source),
+            median_share_repeat = round(median(share_repeat_visits, na.rm = TRUE), 3),
+            .groups = "drop")
+```
+
+```{r diagnostic-e-plot, fig.width=11, fig.height=4.5}
+plot_by_channel(
+  qualifying,
+  function(d, lab)
+    ggplot(d, aes(x = share_repeat_visits)) +
+      geom_histogram(binwidth = 0.05, fill = "darkorange", alpha = 0.7, boundary = 0) +
+      variant_facets() +
+      labs(title = "Share of visits to repeatedly visited sources", subtitle = lab,
+           x = "Share of repeat-source visits", y = "Participants") +
+      theme_minimal(),
+  "diagE_repeat_source_share.png")
+```
+
+## F: log-duration weighting versus raw duration weighting
+
+Session duration in tracking data is heavily right-skewed and
+approximately log-normally distributed (Meiss et al., 2009; Brinberg et
+al., 2022), so a few very long sessions -- idle tabs, autoplay,
+background windows -- can dominate a linearly duration-weighted average.
+This checks whether that matters here: level is recomputed with
+`log1p(duration)` as the weight and correlated against the raw-weighted
+version, per variant. `log1p()` avoids the `log(0)` problem without an
+arbitrary epsilon.
+
+```{r diagnostic-f-logweight}
+weighted_mean_log_na <- function(x, w) {
+  keep <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  w_log <- log1p(w[keep])
+  sum(x[keep] * w_log) / sum(w_log)
+}
+
+# Takes the channel name and indexes straight into visits_baseline, which is
+# already channel-split and window-filtered -- same input as the main build.
+build_variant_logw <- function(channel, flag_col) {
+  v <- visits_baseline[[channel]]
+  v <- if (is.na(flag_col)) v else v[v[[flag_col]] %in% TRUE, , drop = FALSE]
+
+  v %>%
+    group_by(pid) %>%
+    summarise(log_duration_weighted_pc1 = weighted_mean_log_na(pc1, duration),
+              .groups = "drop")
+}
+
+habitual_logw <- analysis_grid %>%
+  mutate(activity = map2(channel, flag_col, build_variant_logw)) %>%
+  dplyr::select(channel, variant, activity) %>%
+  unnest(activity)
+
+logw_compare <- habitual_long %>%
+  dplyr::select(pid, channel, variant, variant_label,
+                meets_activity_threshold, duration_weighted_pc1) %>%
+  left_join(habitual_logw, by = c("pid", "channel", "variant")) %>%
+  mutate(log_duration_weighted_pc1 =
+           if_else(meets_activity_threshold, log_duration_weighted_pc1, NA_real_))
+
+# Guard against the fan-out that produced n > 791 in the first run.
+stopifnot(nrow(logw_compare) == nrow(habitual_long))
+
+cat("Raw vs. log-duration-weighted level, per channel and variant:\n")
+logw_compare %>%
+  filter(!is.na(duration_weighted_pc1), !is.na(log_duration_weighted_pc1)) %>%
+  group_by(channel, variant, variant_label) %>%
+  summarise(n = n(),
+            r = round(cor(duration_weighted_pc1, log_duration_weighted_pc1), 3),
+            mean_abs_diff = round(mean(abs(duration_weighted_pc1 - log_duration_weighted_pc1)), 4),
+            .groups = "drop") %>%
+  print()
+
+write_csv(logw_compare, file.path(diagnostics_dir, "diagF_log_weighting.csv"))
+```
+
+```{r diagnostic-f-plot, fig.width=12, fig.height=7}
+p_logw <- logw_compare %>%
+  filter(!is.na(duration_weighted_pc1), !is.na(log_duration_weighted_pc1)) %>%
+  ggplot(aes(x = duration_weighted_pc1, y = log_duration_weighted_pc1)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +
+  facet_grid(channel ~ variant_label) +
+  labs(title = "Quality level: raw vs. log-duration weighting",
+       x = "Duration-weighted PC1", y = "Log-duration-weighted PC1") +
+  theme_minimal()
+
+print(p_logw)
+ggsave(file.path(diagnostics_dir, "diagF_logweight_faceted.png"), p_logw, width = 12, height = 7)
+```
+
+**Reading rule.** `r` above roughly .95 means the weighting choice does
+not materially reorder participants; keep raw duration-weighting for
+interpretability and note the check in one sentence. Markedly lower `r`
+means a minority of extreme sessions is driving that variant's score,
+and the log-weighted version should be carried forward as a reported
+robustness check.
+
+```{r diagnostic-f-split-agreement}
+split_agreement <- logw_compare %>%
+  filter(!is.na(duration_weighted_pc1), !is.na(log_duration_weighted_pc1)) %>%
+  group_by(channel, variant, variant_label) %>%
+  mutate(
+    split_raw = if_else(duration_weighted_pc1     <= median(duration_weighted_pc1),     "low", "high"),
+    split_log = if_else(log_duration_weighted_pc1 <= median(log_duration_weighted_pc1), "low", "high")
+  ) %>%
+  summarise(
+    n            = n(),
+    n_agree      = sum(split_raw == split_log),
+    pct_agree    = round(100 * mean(split_raw == split_log), 1),
+    n_switch     = sum(split_raw != split_log),
+    .groups = "drop"
+  )
+
+cat("Median-split agreement, raw vs. log weighting:\n")
+print(split_agreement)
+write_csv(split_agreement, file.path(diagnostics_dir, "diagF_split_agreement.csv"))
+```
+
+```{r diagnostic-f-export-split}
+# Exported so 03b can re-run the moderation with the alternative weighting.
+logw_split <- logw_compare %>%
+  filter(!is.na(log_duration_weighted_pc1)) %>%
+  group_by(channel, variant) %>%
+  mutate(habitual_diet_logw = if_else(
+    log_duration_weighted_pc1 <= median(log_duration_weighted_pc1), "low", "high")) %>%
+  ungroup() %>%
+  dplyr::select(pid, channel, variant,
+                log_duration_weighted_pc1, habitual_diet_logw)
+
+write_csv(logw_split, file.path(output_dir, "habitual_logweighted_split.csv"))
+cat("Exported log-weighted level and split for", n_distinct(logw_split$pid), "participants\n")
+```
+
+
+```{r diagnostic-f2-duration-distribution}
+dur_check_hab <- bind_rows(visits_baseline) %>%
+  as_tibble() %>%
+  filter(!is.na(pc1))
+
+cat("Duration distribution of scored baseline visits (seconds):\n")
+dur_check_hab %>%
+  summarise(n = n(),
+            min = min(duration, na.rm = TRUE),
+            p25 = quantile(duration, .25, na.rm = TRUE),
+            median = median(duration, na.rm = TRUE),
+            p75 = quantile(duration, .75, na.rm = TRUE),
+            p95 = quantile(duration, .95, na.rm = TRUE),
+            p99 = quantile(duration, .99, na.rm = TRUE),
+            max = max(duration, na.rm = TRUE),
+            n_zero = sum(duration == 0, na.rm = TRUE)) %>%
+  print(width = Inf)
+
+cat("\nVisits above plausible reading thresholds:\n")
+dur_check_hab %>%
+  summarise(n = n(),
+            over_30min = sum(duration > 1800, na.rm = TRUE),
+            over_1h    = sum(duration > 3600, na.rm = TRUE),
+            over_3h    = sum(duration > 10800, na.rm = TRUE),
+            over_8h    = sum(duration > 28800, na.rm = TRUE),
+            pct_over_30min = round(100 * mean(duration > 1800, na.rm = TRUE), 2),
+            share_of_total_time_over_30min =
+              round(100 * sum(duration[duration > 1800], na.rm = TRUE) /
+                      sum(duration, na.rm = TRUE), 1)) %>%
+  print(width = Inf)
+
+# Same, split by diet definition -- the overall diet was the most
+# weighting-sensitive variant in Diagnostic F.
+cat("\nBy diet definition:\n")
+bind_rows(
+  dur_check_hab %>% mutate(variant = "overall"),
+  dur_check_hab %>% filter(is_news %in% TRUE) %>% mutate(variant = "news"),
+  dur_check_hab %>% filter(is_news_corrected %in% TRUE) %>% mutate(variant = "news_corrected")
+) %>%
+  group_by(variant) %>%
+  summarise(n = n(),
+            median = median(duration, na.rm = TRUE),
+            p99 = quantile(duration, .99, na.rm = TRUE),
+            max = max(duration, na.rm = TRUE),
+            pct_over_30min = round(100 * mean(duration > 1800, na.rm = TRUE), 2),
+            share_time_over_30min =
+              round(100 * sum(duration[duration > 1800], na.rm = TRUE) /
+                      sum(duration, na.rm = TRUE), 1),
+            .groups = "drop") %>%
+  print(width = Inf)
+```
+## G: Capping
+```{r diagnostic-g-capping}
+# Capping addresses a measurement artefact: sessions of several hours are
+# parked tabs, not reading time. Unlike the log transformation, capping
+# leaves the 97% of unremarkable visits untouched and keeps the measure
+# interpretable as quality per unit of browsing time.
+caps <- c("cap_30min" = 1800L, "cap_1h" = 3600L, "cap_3h" = 10800L)
+
+build_variant_capped <- function(channel, flag_col, cap_seconds) {
+  v <- visits_baseline[[channel]]
+  v <- if (is.na(flag_col)) v else v[v[[flag_col]] %in% TRUE, , drop = FALSE]
+
+  v %>%
+    mutate(duration_capped = pmin(duration, cap_seconds)) %>%
+    group_by(pid) %>%
+    summarise(level_capped = weighted_mean_na(pc1, duration_capped),
+              .groups = "drop")
+}
+
+capped_levels <- purrr::imap_dfr(caps, function(cap_seconds, cap_label) {
+  analysis_grid %>%
+    mutate(activity = map2(channel, flag_col, build_variant_capped,
+                           cap_seconds = cap_seconds)) %>%
+    dplyr::select(channel, variant, activity) %>%
+    unnest(activity) %>%
+    mutate(cap = cap_label)
+})
+
+cap_compare <- habitual_long %>%
+  dplyr::select(pid, channel, variant, variant_label,
+                meets_activity_threshold, duration_weighted_pc1) %>%
+  left_join(capped_levels, by = c("pid", "channel", "variant"),
+            relationship = "one-to-many") %>%
+  mutate(level_capped = if_else(meets_activity_threshold, level_capped, NA_real_)) %>%
+  filter(!is.na(duration_weighted_pc1), !is.na(level_capped))
+```
+
+```{r diagnostic-g-time-affected}
+# How much weight is actually removed at each threshold?
+cat("Share of weighted time removed by capping, by variant:\n")
+bind_rows(
+  dur_check_hab %>% mutate(variant = "overall"),
+  dur_check_hab %>% filter(is_news %in% TRUE) %>% mutate(variant = "news"),
+  dur_check_hab %>% filter(is_news_corrected %in% TRUE) %>% mutate(variant = "news_corrected")
+) %>%
+  group_by(variant) %>%
+  summarise(
+    n_visits = n(),
+    pct_visits_capped_30min = round(100 * mean(duration > 1800), 2),
+    pct_visits_capped_1h    = round(100 * mean(duration > 3600), 2),
+    pct_visits_capped_3h    = round(100 * mean(duration > 10800), 2),
+    pct_time_removed_30min  = round(100 * (1 - sum(pmin(duration, 1800))  / sum(duration)), 1),
+    pct_time_removed_1h     = round(100 * (1 - sum(pmin(duration, 3600))  / sum(duration)), 1),
+    pct_time_removed_3h     = round(100 * (1 - sum(pmin(duration, 10800)) / sum(duration)), 1),
+    .groups = "drop"
+  ) %>%
+  as.data.frame() %>% print()
+```
+
+```{r diagnostic-g-level-agreement}
+cat("\nCapped vs. uncapped level, by cap and variant (with_apps only):\n")
+cap_compare %>%
+  filter(channel == "with_apps") %>%
+  group_by(cap, variant, variant_label) %>%
+  summarise(n = n(),
+            r = round(cor(duration_weighted_pc1, level_capped), 3),
+            mean_diff = round(mean(level_capped - duration_weighted_pc1), 4),
+            mean_abs_diff = round(mean(abs(level_capped - duration_weighted_pc1)), 4),
+            .groups = "drop") %>%
+  arrange(variant, cap) %>%
+  as.data.frame() %>% print()
+```
+
+```{r diagnostic-g-split-agreement}
+# The moderation analysis uses the median split, so this is the comparison
+# that decides whether the choice of threshold matters substantively.
+cat("\nMedian-split agreement, capped vs. uncapped:\n")
+cap_compare %>%
+  group_by(channel, cap, variant, variant_label) %>%
+  mutate(split_uncapped = if_else(duration_weighted_pc1 <= median(duration_weighted_pc1), "low", "high"),
+         split_capped   = if_else(level_capped          <= median(level_capped),          "low", "high")) %>%
+  summarise(n = n(),
+            pct_agree = round(100 * mean(split_uncapped == split_capped), 1),
+            n_switch  = sum(split_uncapped != split_capped),
+            .groups = "drop") %>%
+  arrange(channel, variant, cap) %>%
+  as.data.frame() %>% print()
+
+# And the comparison that decides whether the threshold itself is an
+# analytic fork: do the three caps agree with each other?
+cat("\nAgreement between cap thresholds (with_apps):\n")
+cap_compare %>%
+  filter(channel == "with_apps") %>%
+  dplyr::select(pid, variant, variant_label, cap, level_capped) %>%
+  pivot_wider(names_from = cap, values_from = level_capped) %>%
+  group_by(variant, variant_label) %>%
+  summarise(n = n(),
+            r_30min_vs_1h = round(cor(cap_30min, cap_1h), 4),
+            r_1h_vs_3h    = round(cor(cap_1h, cap_3h), 4),
+            r_30min_vs_3h = round(cor(cap_30min, cap_3h), 4),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+
+write_csv(cap_compare, file.path(diagnostics_dir, "diagG_capping_comparison.csv"))
+```
+# Part 8: Which Definition Carries the Most Information
+
+"Most information" is not one number. It trades off how many
+participants get a usable score, how much that score varies across
+participants, how stable it is against arbitrary design choices, and —
+once an outcome exists — how strongly it relates to that outcome. The
+table assembles the design-stage criteria.
+
+```{r variant-comparison}
+variant_comparison <- habitual_long %>%
+  group_by(channel, channel_label, variant, variant_label) %>%
+  summarise(
+    n_participants          = n(),
+    n_meets_activity        = sum(meets_activity_threshold),
+    pct_level_available     = round(100 * sum(!is.na(duration_weighted_pc1)) / n(), 1),
+    pct_diversity_available = round(100 * sum(!is.na(duration_weighted_sd_pc1)) / n(), 1),
+    sd_level                = round(sd(duration_weighted_pc1, na.rm = TRUE), 4),
+    sd_diversity            = round(sd(duration_weighted_sd_pc1, na.rm = TRUE), 4),
+    median_n_rows_with_pc1  = median(n_rows_with_pc1),
+    .groups = "drop"
+  ) %>%
+  left_join(agreement_30day_full %>%
+              group_by(channel, variant) %>%
+              summarise(stability_30day_vs_full_r = round(cor(pc1_30day, pc1_full), 3),
+                        .groups = "drop"),
+            by = c("channel", "variant"))
+
+variant_comparison
+write_csv(variant_comparison, file.path(channel_dirs[["with_apps"]],
+                                        "habitual_media_diet_variant_comparison.csv"))
+```
+
+```{r variant-comparison-plot, fig.width=9, fig.height=5}
+plot_by_channel(
+  variant_comparison %>%
+    dplyr::select(channel, variant_label, pct_level_available,
+                  pct_diversity_available, sd_level, sd_diversity) %>%
+    pivot_longer(-c(channel, variant_label), names_to = "criterion", values_to = "value") %>%
+    mutate(criterion_group = if_else(grepl("^pct_", criterion),
+                                     "Coverage (% participants)", "Variance (SD)"),
+           criterion = if_else(grepl("level", criterion), "Level", "Diversity")),
+  function(d, lab)
+    ggplot(d, aes(x = variant_label, y = value, fill = criterion)) +
+      geom_col(position = "dodge") +
+      facet_wrap(~ criterion_group, scales = "free_y") +
+      labs(title = "Coverage and variance trade-off", subtitle = lab,
+           x = NULL, y = NULL, fill = NULL) +
+      theme_minimal() + theme(axis.text.x = element_text(angle = 15, hjust = 1)),
+  "MAIN_plot_variant_comparison.png", width = 9, height = 5)
+```
+
+# Final notes
+
+| Analysis purpose | Variable in the wide file |
+|------------------------------------|------------------------------------|
+| Broad scored information diet | `hab_overall_dw_pc1`, `hab_overall_dw_sd_pc1` |
+| Sensitivity to the automated coding | `hab_news_dw_pc1`, `hab_news_dw_sd_pc1` |
+| Primary news-quality analysis | `hab_news_corrected_dw_pc1`, `hab_news_corrected_dw_sd_pc1` |
+| Descriptive subgroup analysis only | `hab_<variant>_level_group`, `hab_<variant>_diversity_group`, `hab_<variant>_level_diversity_group` |
+| App-traffic robustness | the same measures from the `without_apps` directory |
+
+Every one of these is a **pre-treatment** measure. None of them may be
+used as an endogenous exposure or as a mediator in `03b`--`03e`; that
+role belongs to the `exp_` measures from `03a`.
+
+Before using a news-specific diversity measure in a model, check
+`pct_diversity_available`. Diversity requires at least two distinct PC1
+values among the relevant visits, so its sample can be smaller than the
+sample for level.

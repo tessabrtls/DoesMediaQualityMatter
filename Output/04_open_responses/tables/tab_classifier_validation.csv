@@ -1,0 +1,23 @@
+Topic,Tier,Label,N,Manual_pct,Model_pct,Agreement,Kappa
+Child support,generic,Verantwortung,120,12.5,80.0,27.5,0.0
+Child support,generic,Konflikt,120,2.5,79.167,23.333,0.013
+Child support,generic,Betroffenheit,120,14.167,90.833,18.333,-0.03
+Child support,generic,Wirtschaftlichkeit,120,30.0,74.167,37.5,-0.047
+Child support,generic,Moral,120,6.667,83.333,21.667,0.007
+Child support,issue,Armutsbekaempfung,120,22.5,80.0,40.833,0.11
+Child support,issue,Buerokratie,120,8.333,35.0,65.0,0.067
+Child support,issue,Bildungschancen,120,14.167,69.167,41.667,0.085
+Child support,issue,Finanzierung,120,9.167,47.5,51.667,-0.008
+Child support,issue,Umsetzung,120,8.333,37.5,62.5,0.053
+Child support,stance,pro/contra/ambivalent,120,,,61.667,0.258
+Cannabis,generic,Verantwortung,120,14.167,65.833,36.667,-0.032
+Cannabis,generic,Konflikt,120,1.667,85.0,16.667,0.006
+Cannabis,generic,Betroffenheit,120,17.5,90.833,25.0,0.02
+Cannabis,generic,Wirtschaftlichkeit,120,2.5,75.833,25.0,-0.006
+Cannabis,generic,Moral,120,1.667,82.5,19.167,0.007
+Cannabis,issue,Jugendschutz,120,13.333,45.0,66.667,0.281
+Cannabis,issue,Kriminalitaet,120,15.0,16.667,73.333,0.0
+Cannabis,issue,Gesundheit,120,36.667,64.167,47.5,0.024
+Cannabis,issue,Freiheit,120,6.667,36.667,66.667,0.133
+Cannabis,issue,Regulierung,120,31.667,65.833,57.5,0.238
+Cannabis,stance,pro/contra/ambivalent,120,,,58.333,0.252

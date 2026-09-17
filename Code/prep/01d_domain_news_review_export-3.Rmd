@@ -1,0 +1,355 @@
+---
+title: "Manual Review Export: Domain-Level is_news Flag"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = TRUE, message = TRUE)
+```
+
+# Overview
+
+Builds the domain-level base table used for manual `is_news` reclassification.
+Four things, in this order:
+
+1. Replace app identifiers in `content_id` with readable app names
+2. Replace those app names with their mapped publisher domain, where the
+   manual review found one
+3. Attach the external PC1 quality score, with integrity checks on the lookup
+4. Collapse to one row per domain and add the pre- vs. experiment-window
+   visit counts
+
+`is_news` itself is never changed here. This script only produces the base
+table that `01e` reads back in, reviews, and turns into `is_news_corrected`.
+
+## Why app traffic is folded into domains first
+
+`content_id` holds three different kinds of value depending on `visit_type`:
+a domain for web rows, an `app_id` for app rows as delivered, and after the
+two remaps below, a publisher domain for those app rows that have one. Folding
+apps into their publisher domain before any aggregation is what allows a
+domain's app traffic and web traffic to count toward the same row. Without it,
+a newspaper read mostly through its app would rank far below its true traffic
+in the Top-N cutoff that drives the manual review.
+
+`visit_type` is never modified by either remap. A row that arrived as
+`visit_type == 2` stays `visit_type == 2` even after `content_id` becomes a
+domain, so the channel a domain's traffic came through is never lost. It is
+preserved per domain as `visit_types_observed`.
+
+| Step | `content_id` before | `content_id` after | Lookup | Key |
+|---|---|---|---|---|
+| 1 | `app_id` | `app_n` (readable name) | `app_metadata_lookup` | `app_id`, exact |
+| 2 | `app_n` | publisher domain | `apps_websites_corrected_with_pc1.xlsx` | `app_n`, case- and whitespace-normalised |
+
+Step 2 resolves by normalised name rather than by `app_id` on purpose. Several
+apps ship as more than one `app_id` (typically an iOS and an Android build).
+If the reviewer coded only one of the two, resolving by `app_id` would leave
+the other unmapped even though the same app is already mapped under its
+sibling identifier. Resolving by name lets every `app_id` sharing a name
+inherit the same single domain. Apps coded `no_editorial_domain` or
+`uncertain` are deliberately left as `app_n`, never force-mapped.
+
+## Outputs
+
+| Object | Level | Role |
+|---|---|---|
+| `visits_with_apps_as_domains.Rds` / `.RData` | Visit | `visits_raw_period` with app rows folded into their publisher domain |
+| `all_unique_domains_visited.csv` | Domain | One row per domain: traffic totals, channels, category, `is_news`, PC1 |
+| `domain_reclass_base_with_apps_as_domains.Rds` / `.RData` | Domain | The above plus pre- and experiment-window visit counts; consumed by `01e` |
+| `pc1_lookup_conflicts.csv` | Domain | Domains carrying more than one PC1 value in the source file, if any |
+| `domains_mixed_is_news.csv` | Domain | Domains whose visit rows disagree on `is_news`, if any |
+
+The Top-N review workbook is exported in `01e`, not here.
+
+# Part 1: Setup
+
+```{r libraries}
+library(dplyr)
+library(readr)
+library(stringr)
+library(tidyr)
+library(readxl)
+```
+
+```{r paths-config-data, include=FALSE}
+
+data_dir     <- "~/Desktop/Masterarbeit/Data"
+
+```
+
+
+```{r paths-config, include=TRUE}
+#data_dir     <- ""
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+output_dir <- file.path(project_root, "Output", "01_visits")
+
+visits_path       <- file.path(output_dir, "visits_raw_period_categories.Rds")
+app_metadata_path <- file.path(output_dir, "app_metadata_lookup.Rds")
+app_mapping_path  <- file.path(output_dir, "apps_websites_corrected_with_pc1.xlsx")
+pc1_path          <- file.path(data_dir, "domain-pc1_with_de.csv")
+```
+
+
+
+```{r helpers}
+# .Rds for readRDS() reuse, .RData so the object loads under its own name,
+# matching how df1/df2/df3 are loaded elsewhere in the pipeline.
+save_both <- function(obj, name, dir = output_dir) {
+  assign(name, obj)
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  save(list = name, file = file.path(dir, paste0(name, ".RData")))
+}
+
+# Both remap steps do the same thing: for app rows only, look up the current
+# content_id in a named vector and overwrite it where a match exists. Rows
+# without a match keep what they have rather than becoming NA.
+remap_app_content_id <- function(visits, map, label, normalise = FALSE) {
+  is_app <- visits$visit_type == 2L
+  key <- if (normalise) str_squish(str_to_lower(visits$content_id)) else visits$content_id
+  hit <- is_app & key %in% names(map)
+
+  visits$content_id[hit] <- unname(map[key[hit]])
+
+  cat(label, "\n  app rows:", sum(is_app),
+      "| remapped:", sum(hit),
+      "| left unchanged:", sum(is_app) - sum(hit), "\n")
+  visits
+}
+```
+
+```{r load-visits}
+visits <- readRDS(visits_path)
+cat("Visit rows:", nrow(visits), "| distinct content_id:", n_distinct(visits$content_id), "\n")
+```
+
+# Part 2: App Identifiers to App Names
+
+```{r remap-app-id}
+app_name_map <- readRDS(app_metadata_path) %>%
+  mutate(across(c(app_id, app_n), as.character)) %>%
+  distinct(app_id, .keep_all = TRUE) %>%
+  { setNames(.$app_n, .$app_id) }
+
+visits <- remap_app_content_id(visits, app_name_map, "Step 1: app_id -> app_n")
+```
+
+# Part 3: App Names to Publisher Domains
+
+Only rows with `mapping_status == "checked"` and a non-missing `news_domain`
+are applied. Names are normalised for whitespace and case only, so that "AOL"
+and "AOL " are treated as one name; this is formatting cleanup, not a semantic
+rewrite.
+
+If the same normalised name carries two different `news_domain` values across
+its `app_id` rows, that is a coding conflict in the workbook, not something to
+resolve silently. The script stops and names the offending entries.
+
+```{r read-app-mapping}
+app_mapping <- read_excel(app_mapping_path) %>%
+  mutate(across(c(app_id, app_n, news_domain, mapping_status), as.character),
+         app_n_key = str_squish(str_to_lower(app_n)))
+
+cat("Rows in mapping workbook:", nrow(app_mapping), "\n")
+print(table(app_mapping$mapping_status, useNA = "ifany"))
+
+checked <- app_mapping %>%
+  filter(mapping_status == "checked", !is.na(news_domain), news_domain != "")
+
+conflicts <- checked %>%
+  distinct(app_n_key, news_domain) %>%
+  count(app_n_key) %>%
+  filter(n > 1)
+
+if (nrow(conflicts) > 0) {
+  stop(nrow(conflicts), " app name(s) map to more than one news_domain: ",
+       paste(conflicts$app_n_key, collapse = ", "),
+       ". Resolve these in the workbook before proceeding.")
+}
+
+app_domain_map <- checked %>%
+  distinct(app_n_key, .keep_all = TRUE) %>%
+  { setNames(.$news_domain, .$app_n_key) }
+
+cat("Distinct app names with a usable checked domain:", length(app_domain_map),
+    "| app_ids directly checked:", n_distinct(checked$app_id),
+    "| app_ids covered once aligned by name:",
+    n_distinct(app_mapping$app_id[app_mapping$app_n_key %in% names(app_domain_map)]), "\n")
+```
+
+```{r remap-app-domain}
+visits_with_apps_as_domains <- remap_app_content_id(
+  visits, app_domain_map, "Step 2: app_n -> publisher domain", normalise = TRUE
+)
+
+save_both(visits_with_apps_as_domains, "visits_with_apps_as_domains")
+```
+
+# Part 4: PC1 Domain Quality Scores
+
+Loaded once and joined onto the domain table below, so the manual review in
+`01e` can already see which domains carry an external score.
+
+Two integrity checks before the join. Both matter because a domain-level
+lookup that is not one row per domain fans out the join and silently
+duplicates domains in every downstream table.
+
+```{r load-pc1}
+pc1_raw <- read_csv2(pc1_path, show_col_types = FALSE) %>%
+  mutate(domain = as.character(domain), pc1 = as.numeric(pc1)) %>%
+  filter(!is.na(domain), domain != "")
+
+# Check 1: does any domain carry more than one distinct PC1 value?
+pc1_conflicts <- pc1_raw %>%
+  distinct(domain, pc1) %>%
+  count(domain) %>%
+  filter(n > 1)
+
+if (nrow(pc1_conflicts) > 0) {
+  write_csv(pc1_raw %>% semi_join(pc1_conflicts, by = "domain") %>% arrange(domain),
+            file.path(output_dir, "pc1_lookup_conflicts.csv"))
+  stop(nrow(pc1_conflicts), " domain(s) carry more than one PC1 value in ",
+       basename(pc1_path), ". Written to pc1_lookup_conflicts.csv; resolve before proceeding.")
+}
+
+domain_pc1 <- pc1_raw %>% distinct(domain, .keep_all = TRUE) %>% dplyr::select(domain, pc1)
+
+cat("Domains with a PC1 score:", nrow(domain_pc1), "\n")
+```
+
+Suffix composition of the lookup, so the manually added German-domain entries
+are visible as a count rather than an assumption. Any change to the coverage of
+`.de` domains propagates directly into how much of German news consumption
+carries a quality score at all.
+
+```{r pc1-suffix-profile}
+domain_pc1 %>%
+  mutate(suffix = str_extract(domain, "\\.[a-z]+$")) %>%
+  count(suffix, sort = TRUE) %>%
+  slice_head(n = 12)
+```
+
+# Part 5: Domain-Level Totals, One Row per Domain
+
+Grouped by `content_id` alone, not by `visit_type` as well, so a domain
+reached through more than one channel sums to a single row with its full
+traffic instead of splitting across rows and distorting the traffic ranking
+that drives the Top-N cutoff.
+
+`visit_type` survives as a comma-joined `visit_types_observed` column, computed
+separately from the totals. `category_1/2/3`, `app_cat` and `is_news` can
+differ across rows for the same `content_id` — across export batches, and now
+also because a remapped app row and a web row for the same domain may disagree.
+Each is resolved to its most frequently observed value, which keeps the table
+one row per domain without a second many-to-many join.
+
+```{r mixed-is-news-check}
+# is_news disagreement within a domain is worth seeing rather than silently
+# majority-voting away, since it is a direct consequence of folding app traffic
+# into web domains.
+mixed_is_news <- visits_with_apps_as_domains %>%
+  distinct(content_id, is_news) %>%
+  count(content_id) %>%
+  filter(n > 1)
+
+cat("Domains whose visit rows disagree on is_news:", nrow(mixed_is_news), "\n")
+
+if (nrow(mixed_is_news) > 0) {
+  write_csv(
+    visits_with_apps_as_domains %>%
+      semi_join(mixed_is_news, by = "content_id") %>%
+      count(content_id, visit_type, is_news, name = "n_rows") %>%
+      arrange(content_id),
+    file.path(output_dir, "domains_mixed_is_news.csv")
+  )
+}
+```
+
+```{r domain-level-totals}
+# One helper for the three "most frequent value per domain" resolutions.
+modal_by_domain <- function(df, cols) {
+  df %>%
+    count(across(all_of(c("content_id", cols))), name = "n_occurrences") %>%
+    group_by(content_id) %>%
+    slice_max(n_occurrences, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    dplyr::select(all_of(c("content_id", cols)))
+}
+
+all_unique_domains_visited <- visits_with_apps_as_domains %>%
+  count(content_id, name = "n_visits_total") %>%
+  left_join(
+    visits_with_apps_as_domains %>%
+      filter(visit_type %in% c(0L, 1L)) %>%
+      count(content_id, name = "n_visits_excl_app"),
+    by = "content_id") %>%
+  left_join(modal_by_domain(visits_with_apps_as_domains, "is_news"), by = "content_id") %>%
+  left_join(modal_by_domain(visits_with_apps_as_domains,
+                            c("category_1", "category_2", "category_3", "app_cat")),
+            by = "content_id") %>%
+  left_join(
+    visits_with_apps_as_domains %>%
+      group_by(content_id) %>%
+      summarise(visit_types_observed = paste(sort(unique(visit_type)), collapse = ", "),
+                .groups = "drop"),
+    by = "content_id") %>%
+  mutate(n_visits_excl_app = replace_na(n_visits_excl_app, 0L)) %>%
+  rename(domain = content_id) %>%
+  left_join(domain_pc1, by = "domain", relationship = "many-to-one") %>%
+  dplyr::select(domain, category_1, category_2, category_3, app_cat, is_news,
+                n_visits_total, n_visits_excl_app, visit_types_observed, pc1) %>%
+  arrange(desc(n_visits_total))
+
+# One row per domain is what every downstream join assumes. Assert it.
+stopifnot(n_distinct(all_unique_domains_visited$domain) == nrow(all_unique_domains_visited))
+
+write_csv(all_unique_domains_visited, file.path(output_dir, "all_unique_domains_visited.csv"))
+
+tibble(
+  domains          = nrow(all_unique_domains_visited),
+  with_app_traffic = sum(all_unique_domains_visited$n_visits_total >
+                         all_unique_domains_visited$n_visits_excl_app),
+  with_pc1         = sum(!is.na(all_unique_domains_visited$pc1)),
+  flagged_is_news  = sum(all_unique_domains_visited$is_news, na.rm = TRUE)
+)
+```
+
+# Part 6: Reclassification Base Table
+
+`experiment_visits` sums every `during_w1` / `during_w2` / `during_w3` row;
+`pre_visits` is the `pre` period alone. `between_*` and `post` visits belong to
+neither window and are excluded from both counts, though they still count
+toward `n_visits_total`.
+
+```{r reclassification-base-table}
+period_window_counts <- visits_with_apps_as_domains %>%
+  filter(!is.na(period)) %>%
+  mutate(window = case_when(
+    period %in% c("during_w1", "during_w2", "during_w3") ~ "experiment_visits",
+    period == "pre" ~ "pre_visits",
+    TRUE ~ "other"
+  )) %>%
+  count(content_id, window) %>%
+  pivot_wider(names_from = window, values_from = n, values_fill = 0L) %>%
+  rename(domain = content_id) %>%
+  dplyr::select(-any_of("other"))
+
+domain_reclass_base <- all_unique_domains_visited %>%
+  left_join(period_window_counts, by = "domain", relationship = "one-to-one") %>%
+  mutate(
+    across(c(experiment_visits, pre_visits), ~ replace_na(.x, 0L)),
+    reclassification_note   = NA_character_,
+    reclassification_status = "uncertain"
+  )
+
+save_both(domain_reclass_base, "domain_reclass_base_with_apps_as_domains")
+
+cat("Rows in domain_reclass_base:", nrow(domain_reclass_base),
+    "| with any experiment-window traffic:", sum(domain_reclass_base$experiment_visits > 0), "\n")
+```

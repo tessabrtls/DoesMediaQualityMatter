@@ -1,0 +1,28 @@
+Topic,Variant,Quantity,Estimate,CI_low,CI_high,N
+Cannabis,news,Difference,0.098,-0.384,0.765,85
+Cannabis,news,IE high,-0.064,-0.619,0.407,85
+Cannabis,news,IE low,0.034,-0.187,0.302,85
+Cannabis,news_corrected,Difference,-0.118,-0.669,0.175,85
+Cannabis,news_corrected,IE high,0.063,-0.145,0.404,85
+Cannabis,news_corrected,IE low,-0.055,-0.387,0.108,85
+Cannabis,overall,Difference,-0.039,-0.449,0.222,85
+Cannabis,overall,IE high,0.025,-0.159,0.305,85
+Cannabis,overall,IE low,-0.014,-0.29,0.203,85
+Child support,news,Difference,0.066,-0.375,0.549,89
+Child support,news,IE high,0.024,-0.212,0.342,89
+Child support,news,IE low,0.09,-0.249,0.483,89
+Child support,news_corrected,Difference,0.059,-0.238,0.491,89
+Child support,news_corrected,IE high,0.031,-0.174,0.316,89
+Child support,news_corrected,IE low,0.089,-0.236,0.507,89
+Child support,overall,Difference,-0.011,-0.336,0.377,89
+Child support,overall,IE high,0.058,-0.212,0.406,89
+Child support,overall,IE low,0.047,-0.151,0.382,89
+Energy transition,news,Difference,0.027,-7.128,15.499,24
+Energy transition,news,IE high,-0.031,-4.73,3.906,24
+Energy transition,news,IE low,-0.003,-6.677,10.071,24
+Energy transition,news_corrected,Difference,-0.072,-8.517,10.291,24
+Energy transition,news_corrected,IE high,0.001,-3.304,2.457,24
+Energy transition,news_corrected,IE low,-0.071,-8.019,7.164,24
+Energy transition,overall,Difference,-0.011,-7.46,9.401,24
+Energy transition,overall,IE high,-0.017,-3.969,5.111,24
+Energy transition,overall,IE low,-0.028,-6.002,9.28,24

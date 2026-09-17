@@ -1,0 +1,28 @@
+variable,role,timing,note
+group_f,treatment,randomised,Three-level assignment
+z_verbal,instrument,randomised,Verbal vs. control
+z_money,instrument,randomised,Monetary vs. control
+y_abs,outcome,post,"Primary, |post - pre|"
+y_signed,outcome,post,"Secondary, signed"
+kno_signed,outcome,post,Knowledge change
+exp_topic_uptake_yn,uptake,experimental,"Eq. 3.1, complete"
+effort_count,effort,experimental,"Eq. 3.2, primary"
+topic_duration,effort,experimental,Supplementary
+n_topic_domains,effort,experimental,Supplementary
+q_primary,exposure,experimental,"Eq. 3.3, primary"
+exp_q_unw,exposure,experimental,"Eq. 3.4, sensitivity"
+exp_q_log,exposure,experimental,"Eq. 3.5, sensitivity"
+exp_q_dur_news,exposure,experimental,"News-only set, sensitivity"
+exp_q_dur_all,exposure,experimental,"Incl. search, sensitivity"
+hab_overall_level_group,moderator,pre-treatment,Median split
+hab_news_level_group,moderator,pre-treatment,Median split
+hab_news_corrected_level_group,moderator,pre-treatment,Median split
+att_baseline,covariate,pre,Wave-specific
+prior_engagement,covariate,pre,Wave-specific
+polknow_total,covariate,baseline,
+pol_interest_general,covariate,baseline,
+newsuse_online,covariate,baseline,0-8 days/week
+edu_time,covariate,baseline,
+age,covariate,baseline,
+gender_f,covariate,baseline,
+nfc,covariate,baseline,Sec. 4.10 sensitivity only

@@ -1,0 +1,10 @@
+Topic,Definition,low,high,missing
+Child support,Overall scored diet,292,283,11
+Energy transition,Overall scored diet,298,284,16
+Cannabis,Overall scored diet,301,292,13
+Child support,Automated news diet,246,243,97
+Energy transition,Automated news diet,245,249,104
+Cannabis,Automated news diet,248,253,105
+Child support,Corrected news diet,272,284,30
+Energy transition,Corrected news diet,283,280,35
+Cannabis,Corrected news diet,280,292,34

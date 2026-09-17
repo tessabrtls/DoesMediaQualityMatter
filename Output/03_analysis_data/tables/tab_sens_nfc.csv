@@ -1,0 +1,10 @@
+Topic,Variant,Without NFC,p (without),N (without),With NFC,p (with),N (with)
+Cannabis,news,0.379,0.103,468,0.394,0.107,419
+Cannabis,news_corrected,0.133,0.536,536,-0.042,0.856,472
+Cannabis,overall,-0.316,0.131,554,-0.396,0.077,484
+Child support,news,-0.485,0.031,465,-0.512,0.023,465
+Child support,news_corrected,-0.331,0.121,528,-0.366,0.087,528
+Child support,overall,-0.007,0.971,547,0.007,0.972,547
+Energy transition,news,0.176,0.442,467,0.245,0.311,425
+Energy transition,news_corrected,-0.169,0.429,531,-0.237,0.298,481
+Energy transition,overall,-0.225,0.281,549,-0.158,0.478,496

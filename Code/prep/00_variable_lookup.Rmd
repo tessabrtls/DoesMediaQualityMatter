@@ -1,0 +1,104 @@
+---
+title: "00_variable_lookup"
+output: html_document
+date: "2026-09-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE)
+```
+
+## Variable Lookup / Codebook
+
+
+```{r lookup-libraries}
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+
+```
+
+## Reading the variable-name mapping and value labels
+
+
+```{r , include = FALSE}
+download_root  <- "~/Desktop/Masterarbeit/Data/download/Exp1_Feb+June23"
+values_root    <- "~/Desktop/Masterarbeit/Data"
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+output_dir <- file.path(project_root, "Output", "00_setup")
+```
+
+
+```{r , include = TRUE}
+#output_dir <- file.path(project_root, "Output", "00_setup")
+#project_root <- ""
+#download_root  <- ""
+#values_root    <- ""
+
+wave_files <- tibble::tribble(
+  ~wave,  ~varnames_path,                                                        ~varvalues_path,
+  "T0",   file.path(download_root, "T0_Feb23_base",   "T0_Feb_varnames.xlsx"),   file.path(values_root, "Variablenwerte.xlsx"),
+  "T1",   file.path(download_root, "T1-3_June23_exp", "T1_June_varnames.xlsx"),  file.path(values_root, "Variablenwerte_T1.xlsx"),
+  "T2",   file.path(download_root, "T1-3_June23_exp", "T2_June_varnames.xlsx"),  file.path(values_root, "Variablenwerte_T2.xlsx"),
+  "T3",   file.path(download_root, "T1-3_June23_exp", "T3_June_varnames.xlsx"),  file.path(values_root, "Variablenwerte_T3.xlsx")
+)
+```
+
+```{r lookup-read}
+save_both <- function(obj, name, dir = output_dir) {
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  write.csv(obj, file.path(dir, paste0(name, ".csv")), row.names = FALSE)
+  message("Saved ", name)
+}
+
+# The value-label files carry a varying number of title rows before the real
+# data starts (T0: 1, T1: 1, T2/T3: 2), and the June files head their columns
+# "Wert"/"Label" rather than leaving them blank. So instead of a fixed [-1, ],
+# read with no header, find the row where the data block begins, and take the
+# first three columns as id / value / label. The variable-ID column is only
+# filled on each block's first row, so fill() carries it down.
+read_value_labels <- function(path) {
+  raw <- read_excel(path, sheet = 1, col_names = FALSE, .name_repair = "minimal")
+
+  # Data begins on the row *after* the "Wert" header (June files); for the
+  # Feb file there is no "Wert" row, so fall back to dropping the single
+  # title row, matching the original T0 behaviour.
+  wert_row <- which(raw[[1]] == "Wert")
+  first_data_row <- if (length(wert_row) > 0) wert_row[1] + 1 else 2
+
+  raw[first_data_row:nrow(raw), 1:3] %>%
+    rlang::set_names(c("variable_id", "value_code", "label_text")) %>%
+    mutate(across(everything(), as.character)) %>%
+    fill(variable_id) %>%
+    filter(!is.na(variable_id) | !is.na(value_code) | !is.na(label_text))
+}
+
+lookups <- list()
+
+for (i in seq_len(nrow(wave_files))) {
+  wave <- wave_files$wave[i]
+
+  var_values <- read_value_labels(wave_files$varvalues_path[i])
+
+  var_mapping <- read_excel(wave_files$varnames_path[i]) %>%
+    # Column name for the variable name differs per wave: T0 Var_Name,
+    # T1-2 Varname, T3 Varnames. Harmonize to Var_Name.
+    rename(Var_Name = any_of(c("Varname", "Varnames"))) %>%
+    mutate(Variable = as.character(Variable), Var_Name = as.character(Var_Name))
+
+  lookup <- var_values %>%
+    left_join(var_mapping %>% select(Variable, Var_Name, Label),
+              by = c("variable_id" = "Variable"))
+
+  # Guard: if almost nothing matched, the ID systems don't line up -- fail
+  # loudly rather than silently saving an all-NA sheet.
+  matched <- sum(!is.na(lookup$Var_Name))
+  message(wave, ": ", matched, " of ", nrow(lookup), " value rows matched a variable name.")
+  if (matched == 0) warning(wave, ": no keys matched between value labels and varnames -- check the ID columns.")
+
+  save_both(lookup, paste0("clean_variable_lookup_sheet_", wave))
+  lookups[[wave]] <- lookup
+}
+```
+

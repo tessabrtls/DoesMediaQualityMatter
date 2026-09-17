@@ -1,0 +1,747 @@
+---
+title: "Setup: Participant Sample, and Media/Political Variables"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+One-time setup script, run once before any visit-level or domain-level work.
+Builds four things, in this order:
+
+1. Output-folder skeleton
+2. Participant sample (authoritative starting point of the pipeline)
+3. Media/political/socio-demographic variable set, on top of the sample
+
+## Outputs
+
+| Object | Role |
+|---|---|
+| `Output/00_setup/`, `Output/01_visits/`, ... | Mirrored output-folder skeleton |
+| `participants_february_relevant.rds` | One row per Feb. baseline participant; authoritative dataset |
+| `participants_no_experiment.rds` | Feb. participants never in `df1`/`df2`/`df3` |
+| `pid_lookup_february.rds` | PID + participation flags + group, for joining visit data |
+| `audit_duplicate_pids_excel_t0.csv` | How duplicate Feb. records were resolved |
+| `participants_media_political.rds` | Slim media/political/socio-demographic set |
+| `panelist_metadata_final.rds` | Above, merged with `pid_lookup_february` |
+
+## Sample-definition logic
+
+| Decision | Reasoning |
+|---|---|
+| T0 (Feb. survey) alone defines the sample | Later waves only add participation flags, never overwrite a T0 answer |
+| No later-wave value ever replaces a T0 value | Reconciling values across differently-collected sources adds ambiguity, not clarity |
+| Non-participants stay in the sample (`in_experiment == FALSE`) | They are not dropped, just flagged |
+| Derived scores (`polknow_total`, etc.) come from `df1`/`df2`/`df3` | Kacperski et al. computed them *after* T0; they never existed in the raw T0 file |
+| `election_voted` also comes from `df1`/`df2`/`df3` | T0 stores the same question under a different name (`election_abstain`) -- a naming mismatch, not a missing item |
+
+# Part 1: Mirrored Output-Folder Structure
+
+Builds `Output/` mirroring `Code/`: one subfolder per pipeline stage.
+
+```{r create-folders}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+
+code_dir <- file.path(project_root, "Code")
+setup_dir <- file.path(project_root, "Output")
+output_dir <- file.path(project_root, "Output", "00_setup")
+pipeline_folders <- c(
+  "00_setup", "01_visits", "02_media_quality",
+  "03_analysis_data", "04_analysis_open_answers", "archive"
+)
+
+dir.create(setup_dir, recursive = TRUE, showWarnings = FALSE)
+
+invisible(
+  lapply(file.path(setup_dir, pipeline_folders), dir.create,
+         recursive = TRUE, showWarnings = FALSE)
+)
+```
+
+# Part 2:  Participant Sample from the T0 February Survey
+
+## Packages and paths
+
+```{r participants-libraries}
+library(readr)
+library(readxl)
+library(dplyr)
+library(stringr)
+```
+
+Loads the raw T0 export, `df1`/`df2`/`df3` (wave-based), and PolComm `df_T0`
+(validation reference only, never defines the sample), excluded chunk because of paths
+
+```{r participants-paths , include= FALSE}
+project_root_input <- "~/Desktop/Masterarbeit"
+
+
+path_df1 <- file.path(project_root_input, "Data", "df1_final_ac.Rdata")
+path_df2 <- file.path(project_root_input, "Data", "df2_final_ac.Rdata")
+path_df3 <- file.path(project_root_input, "Data", "df3_final_ac.Rdata")
+
+path_t0_excel   <- file.path(project_root_input, "Data", "download", "Exp1_Feb+June23", "T0_Feb23_base", "T0_Feb_data.xlsx")
+path_t0_mapping <- file.path(project_root_input, "Data", "download", "Exp1_Feb+June23", "T0_Feb23_base", "T0_Feb_varnames.xlsx")
+path_polcomm_t0 <- file.path(project_root_input, "s2j_kg_polcomm-main", "input", "df_T0.Rdata")
+```
+
+## Helper functions
+
+| Function | Purpose |
+|---|---|
+| `standardize_pid()` | PIDs as character strings -- avoids losing leading zeros / silent type mismatches |
+| `is_survey_missing()` | One shared "missing" definition: `NA`, blank, `-77` (user-skipped), `-99` (unanswered open item) |
+| `check_unique_pid()` | Stops if a table has more than one row per PID |
+
+```{r participants-helpers}
+standardize_pid <- function(x) x %>% as.character() %>% str_trim() %>% na_if("")
+
+survey_missing_codes <- c("-77", "-99")
+
+is_survey_missing <- function(x) {
+  x_character <- str_trim(as.character(x))
+  is.na(x) | is.na(x_character) | x_character == "" | x_character %in% survey_missing_codes
+}
+
+check_unique_pid <- function(data, data_name) {
+  if (nrow(data) != n_distinct(data$pid)) {
+    stop("Duplicate PIDs found in ", data_name, ". Expected at most one row per PID.")
+  }
+}
+```
+
+## Loading later-wave data and the PolComm reference
+
+```{r participants-load-waves}
+load(path_df1)
+load(path_df2)
+load(path_df3)
+
+polcomm_objects <- load(path_polcomm_t0)
+df_t0_polcomm <- T0
+```
+
+## Importing and harmonizing the T0 survey
+
+```{r participants-load-t0}
+df_t0_excel_raw <- read_excel(path_t0_excel)
+
+var_mapping_t0 <- read_excel(path_t0_mapping) %>%
+  transmute(raw_name = as.character(Variable), harmonized_name = as.character(Var_Name)) %>%
+  filter(!is.na(raw_name), raw_name != "", !is.na(harmonized_name), harmonized_name != "",
+         raw_name %in% names(df_t0_excel_raw))
+
+df_t0_excel <- df_t0_excel_raw %>%
+  rename(!!!setNames(var_mapping_t0$raw_name, var_mapping_t0$harmonized_name))
+```
+
+## Raw participant table
+
+No `distinct()` here -- duplicates need inspection before resolution.
+
+```{r participants-raw-table}
+participants_february_raw <- df_t0_excel %>%
+  mutate(pid = standardize_pid(pid)) %>%
+  filter(!is.na(pid))
+
+message(
+  "Raw February T0 records with a valid PID: ", nrow(participants_february_raw), "\n",
+  "Unique February PIDs before duplicate resolution: ", n_distinct(participants_february_raw$pid)
+)
+```
+
+## Resolving duplicate records
+
+Selection hierarchy:
+
+1. Most valid substantive answers (excludes `ID`, `pid`, `duration`,
+   `consent`, `time_on_page...`)
+2. Tie-break: chronologically earlier record, via the lfdn-based `ID`
+   (lfdn is strictly ascending by entry order)
+
+```{r participants-duplicates}
+duplicate_pids_excel <- participants_february_raw %>%
+  count(pid, name = "n_records_for_pid") %>%
+  filter(n_records_for_pid > 1)
+
+administrative_variables <- c(
+  "ID", "pid", "duration", "consent",
+  grep("^time_on_page", names(participants_february_raw), value = TRUE)
+)
+substantive_variables <- setdiff(names(participants_february_raw), administrative_variables)
+
+duplicate_record_quality <- tibble(pid = character(), ID = character(), proposed_keep = logical())
+
+if (nrow(duplicate_pids_excel) > 0) {
+
+  duplicate_record_quality <- participants_february_raw %>%
+    semi_join(duplicate_pids_excel, by = "pid") %>%
+    mutate(
+      ID_sort = suppressWarnings(as.numeric(ID)),
+      ID_sort = if_else(is.na(ID_sort), Inf, ID_sort),
+      n_answered_substantive = rowSums(across(all_of(substantive_variables), ~ !is_survey_missing(.x))),
+      n_missing_substantive  = rowSums(across(all_of(substantive_variables), ~ is_survey_missing(.x)))
+    ) %>%
+    group_by(pid) %>%
+    arrange(desc(n_answered_substantive), ID_sort, .by_group = TRUE) %>%
+    mutate(
+      duplicate_record_number = row_number(),
+      n_records_for_pid = n(),
+      proposed_keep = row_number() == 1L,
+      proposed_selection_rule = case_when(
+        !proposed_keep ~ "not_selected",
+        n_answered_substantive > lead(n_answered_substantive, default = -Inf) ~ "highest_substantive_completeness",
+        TRUE ~ "earlier_record_by_lfdn"
+      )
+    ) %>%
+    ungroup() %>%
+    relocate(pid, duplicate_record_number, n_records_for_pid, proposed_keep,
+              proposed_selection_rule, ID, n_answered_substantive, n_missing_substantive)
+
+  write_csv(duplicate_record_quality, file.path(output_dir, "audit_duplicate_pids_excel_t0.csv"))
+
+  message(
+    "Duplicate PIDs identified: ", nrow(duplicate_pids_excel), "\n",
+    "Duplicate audit saved to: Output/00_setup/audit_duplicate_pids_excel_t0.csv"
+  )
+}
+```
+
+Combine unique + selected-duplicate records; confirm only row selection
+changed, not the PID set.
+
+```{r participants-combine-duplicates}
+participants_february <- bind_rows(
+  participants_february_raw %>% anti_join(duplicate_pids_excel, by = "pid"),
+  participants_february_raw %>%
+    semi_join(duplicate_record_quality %>% filter(proposed_keep) %>% select(pid, ID),
+              by = c("pid", "ID"))
+) %>%
+  arrange(pid)
+
+check_unique_pid(participants_february, "participants_february")
+
+stopifnot(setequal(participants_february_raw$pid, participants_february$pid))
+```
+
+## Validating against the PolComm reference
+
+```{r participants-polcomm-validation}
+polcomm_february_pids <- df_t0_polcomm %>%
+  mutate(pid = standardize_pid(pid)) %>%
+  filter(!is.na(pid), month == "february") %>%
+  distinct(pid)
+
+pid_validation_summary <- tibble(
+  n_excel_february_pids   = n_distinct(participants_february$pid),
+  n_polcomm_february_pids = n_distinct(polcomm_february_pids$pid),
+  n_pids_only_in_excel    = nrow(anti_join(participants_february %>% distinct(pid), polcomm_february_pids, by = "pid")),
+  n_pids_only_in_polcomm  = nrow(anti_join(polcomm_february_pids, participants_february %>% distinct(pid), by = "pid"))
+)
+
+pid_validation_summary
+```
+
+| Check | Result |
+|---|---|
+| Excel vs. PolComm PID sets | Identical: 2,446 unique PIDs in both |
+
+## Restricting later waves to the clean sample
+
+Mostly a sanity check -- `df1`/`df2`/`df3` already derive from the Feb. file.
+
+```{r participants-restrict-waves}
+pid_lookup_february <- participants_february %>% transmute(pid)
+
+df1_pid <- df1 %>% mutate(pid = standardize_pid(pid)) %>% filter(!is.na(pid)) %>% semi_join(pid_lookup_february, by = "pid")
+df2_pid <- df2 %>% mutate(pid = standardize_pid(pid)) %>% filter(!is.na(pid)) %>% semi_join(pid_lookup_february, by = "pid")
+df3_pid <- df3 %>% mutate(pid = standardize_pid(pid)) %>% filter(!is.na(pid)) %>% semi_join(pid_lookup_february, by = "pid")
+
+check_unique_pid(df1_pid, "df1_pid")
+check_unique_pid(df2_pid, "df2_pid")
+check_unique_pid(df3_pid, "df3_pid")
+```
+
+## Variables comparable across the whole panel
+
+Intersection (not union) of `df1`/`df2`/`df3` columns, minus technical
+variables, further restricted to variables also present in T0.
+
+```{r participants-variable-selection}
+common_experiment_variables <- Reduce(intersect, list(names(df1_pid), names(df2_pid), names(df3_pid)))
+
+common_experiment_variables <- common_experiment_variables[
+  !str_detect(common_experiment_variables, regex("^time_on_page", ignore_case = TRUE))
+]
+common_experiment_variables <- setdiff(common_experiment_variables, c("ID", "pid", "duration", "consent"))
+
+t0_relevant_variables <- intersect(common_experiment_variables, names(participants_february)) %>% sort()
+
+participants_february_relevant <- participants_february %>%
+  select(all_of(c("pid", t0_relevant_variables)))
+
+check_unique_pid(participants_february_relevant, "participants_february_relevant")
+
+message(
+  "Variables common to df1/df2/df3 before exclusions: ", length(common_experiment_variables), "\n",
+  "Relevant substantive variables retained from T0: ", length(t0_relevant_variables), "\n",
+  "Final columns in participants_february_relevant, incl. pid: ", ncol(participants_february_relevant)
+)
+```
+
+| Metric | Value |
+|---|---|
+| Variables common to `df1`/`df2`/`df3` before exclusions | 611 |
+| Substantive variables also in T0 | 274 |
+| Final columns (incl. `pid`) | 275 |
+
+**Confirmed name mismatch (not a bug):** `election_voted` exists in
+`df1_pid`, but T0 stores the same question as `election_abstain`. Different
+names -> correctly absent from `participants_february_relevant` -> handled
+as a derived score in Part 4 instead.
+
+## Experiment-participation indicators
+
+```{r participants-participation-flags}
+experiment_pid_lookup <- full_join(
+  df1_pid %>% distinct(pid) %>% mutate(in_df1 = TRUE),
+  df2_pid %>% distinct(pid) %>% mutate(in_df2 = TRUE),
+  by = "pid"
+) %>%
+  full_join(df3_pid %>% distinct(pid) %>% mutate(in_df3 = TRUE), by = "pid") %>%
+  mutate(
+    across(c(in_df1, in_df2, in_df3), ~ coalesce(.x, FALSE)),
+    in_experiment = in_df1 | in_df2 | in_df3,
+    n_experiment_waves = as.integer(in_df1) + as.integer(in_df2) + as.integer(in_df3)
+  )
+
+participants_february_relevant <- participants_february_relevant %>%
+  left_join(experiment_pid_lookup, by = "pid") %>%
+  mutate(
+    across(c(in_df1, in_df2, in_df3, in_experiment), ~ coalesce(.x, FALSE)),
+    n_experiment_waves = coalesce(n_experiment_waves, 0L)
+  )
+```
+
+## Treatment-group consistency check
+
+`group_f` must not differ across a participant's waves -- a difference
+would be a data-quality problem, not something to silently average over.
+
+```{r participants-group-check}
+pid_wave_groups <- bind_rows(
+  df1_pid %>% distinct(pid, group_f) %>% mutate(wave = 1L),
+  df2_pid %>% distinct(pid, group_f) %>% mutate(wave = 2L),
+  df3_pid %>% distinct(pid, group_f) %>% mutate(wave = 3L)
+)
+
+group_inconsistencies <- pid_wave_groups %>%
+  group_by(pid) %>%
+  summarise(n_distinct_groups = n_distinct(group_f, na.rm = TRUE), .groups = "drop") %>%
+  filter(n_distinct_groups > 1)
+
+if (nrow(group_inconsistencies) > 0) {
+  stop("group_f is not constant per pid for ", nrow(group_inconsistencies), " pid(s).")
+}
+
+pid_group_lookup <- pid_wave_groups %>%
+  filter(!is.na(group_f)) %>%
+  distinct(pid, group_f) %>%
+  rename(group = group_f)
+
+participants_february_relevant <- participants_february_relevant %>%
+  left_join(pid_group_lookup, by = "pid")
+```
+
+## Experiment vs. non-experiment subsets
+
+```{r participants-split-subsets}
+pid_lookup_february <- participants_february_relevant %>%
+  select(pid, in_df1, in_df2, in_df3, in_experiment, n_experiment_waves, group)
+
+participants_in_experiment <- participants_february_relevant %>% filter(in_experiment)
+participants_no_experiment <- participants_february_relevant %>% filter(!in_experiment)
+
+stopifnot(
+  nrow(participants_february_relevant) ==
+    nrow(participants_in_experiment) + nrow(participants_no_experiment)
+)
+
+participant_sample_summary <- participants_february_relevant %>%
+  summarise(
+    n_february_participants = n(),
+    n_in_experiment = sum(in_experiment),
+    n_no_experiment = sum(!in_experiment),
+    n_in_df1 = sum(in_df1), n_in_df2 = sum(in_df2), n_in_df3 = sum(in_df3),
+    n_with_group = sum(!is.na(group))
+  )
+
+participant_sample_summary
+```
+
+| Group | N |
+|---|---|
+| February baseline (total) | 2,446 |
+| In >= 1 experimental wave | 791 |
+| -- in `df1` | 586 |
+| -- in `df2` | 598 |
+| -- in `df3` | 606 |
+| In no experimental wave | 1,655 |
+
+## Saving
+
+```{r participants-save}
+saveRDS(participants_february_relevant, file.path(output_dir, "participants_february_relevant.rds"))
+saveRDS(participants_no_experiment, file.path(output_dir, "participants_no_experiment.rds"))
+saveRDS(pid_lookup_february, file.path(output_dir, "pid_lookup_february.rds"))
+
+message(
+  "Participant setup completed.\n",
+  "Final February sample size: ", nrow(participants_february_relevant), "\n",
+  "In one or more experiment waves: ", nrow(participants_in_experiment), "\n",
+  "In no experiment wave: ", nrow(participants_no_experiment)
+)
+```
+
+# Part 4: Media / Political / Socio-Demographic Variable Set
+
+Built on top of `participants_february_relevant`. Socio-demographic
+variables match the original paper's supplement covariates (Table SA.4.1),
+so overlap with Part 3 is intentional, not duplicated -- documented in the
+overview file instead.
+
+| Variable group | Source | Why |
+|---|---|---|
+| Social media use/political use, `pol_source_*`, party attitudes, socio-demographics | Raw T0 (`participants_february_relevant`) | Available for all 2,446 participants |
+| `polknow_total`, `internet_use_skill`, `self_pol_total`, `polpart_onl/off_total`, `voting_decision_f`/`_y`, `pol_attitude`, `knowledge_politicians` | `df1`/`df2`/`df3` | Computed by Kacperski et al. after T0; never existed in the raw T0 file |
+| `election_voted` | `df1`/`df2`/`df3` | Same question as T0's `election_abstain`, different name |
+
+## Defining raw T0 variable groups
+
+`pol_source_*` note: all eleven items come from **one shared ranking
+question** (Q9) -- respondents rank only the sources they actually use;
+rank 1 = most used, up to rank 11 = least used; 0 = not used/not ranked.
+Ranks are assigned jointly across all eleven options per person, so they
+are treated as one item battery, not split into independent offline/online
+scales.
+
+```{r media-vargroups}
+socmed_platforms <- c(
+  "socmed_facebook", "socmed_instagram", "socmed_tiktok", "socmed_twitter",
+  "socmed_youtube", "socmed_whatsapp", "socmed_telegram", "socmed_reddit",
+  "socmed_linkedin", "socmed_snapchat", "socmed_pinterest", "socmed_threema",
+  "socmed_signal", "socmed_tumblr", "socmed_twitch", "socmed_xing",
+  "socmed_mastodon", "socmed_nebenan", "socmed_discord", "socmed_other"
+)
+
+socmed_pol_platforms <- c(
+  "socmed_pol_facebook", "socmed_pol_instagram", "socmed_pol_tiktok",
+  "socmed_pol_twitter", "socmed_pol_youtube", "socmed_pol_whatsapp",
+  "socmed_pol_telegram", "socmed_pol_reddit", "socmed_pol_linkedin",
+  "socmed_pol_snapchat", "socmed_pol_pinterest", "socmed_pol_threema",
+  "socmed_pol_signal", "socmed_pol_tumblr", "socmed_pol_twitch",
+  "socmed_pol_xing", "socmed_pol_mastodon", "socmed_pol_nebenan", "socmed_pol_discord"
+)
+
+pol_source_all_items <- c(
+  "pol_source_tv", "pol_source_tv_online",
+  "pol_source_news", "pol_source_news_online",
+  "pol_source_radio", "pol_source_radio_online",
+  "pol_source_messenger", "pol_source_socmed",
+  "pol_source_other_online", "pol_source_conversation", "pol_source_other"
+)
+
+media_singletons_t0 <- c(
+  "newsuse_online", "paperuse_no",
+  "pol_source_none",
+  "pol_debate", "pol_debate_online", "pol_interest_general",
+  "socmed_no", "socmed_pol_topics", "socmed_pol_topics_no"
+)
+
+attitude_party_items <- c(
+  "attitude_cdu", "attitude_csu", "attitude_spd", "attitude_afd",
+  "attitude_fdp", "attitude_linke", "attitude_gruene"
+)
+
+sociodemo_vars_t0 <- c("age", "gender", "edu_time", "education", "income")
+
+derived_score_vars <- c(
+  "pol_attitude", "polknow_total", "knowledge_politicians", "internet_use_skill",
+  "polpart_onl_total", "polpart_off_total", "self_pol_total",
+  "voting_decision_f", "voting_decision_y", "election_voted"
+)
+```
+
+## Verifying variable presence
+
+```{r media-verify}
+all_expected_t0_vars <- unique(c(
+  socmed_platforms, socmed_pol_platforms, pol_source_all_items,
+  media_singletons_t0, attitude_party_items, sociodemo_vars_t0
+))
+
+missing_t0_vars <- setdiff(all_expected_t0_vars, names(participants_february_relevant))
+if (length(missing_t0_vars) > 0) {
+  stop("Missing raw T0 variables (check for renamed Bilendi columns):\n",
+       paste(missing_t0_vars, collapse = ", "))
+}
+
+for (df_name in c("df1_pid", "df2_pid", "df3_pid")) {
+  missing_derived <- setdiff(derived_score_vars, names(get(df_name)))
+  if (length(missing_derived) > 0) {
+    stop("Missing derived scores in ", df_name, ":\n", paste(missing_derived, collapse = ", "))
+  }
+}
+```
+
+## Resolving derived scores across waves
+
+Should be identical across every wave a participant appears in -- take the
+earliest wave, warn (not stop) on mismatches.
+
+```{r media-derived-scores}
+derived_scores_long <- bind_rows(
+  df1_pid %>% select(pid, all_of(derived_score_vars)) %>% mutate(wave_source = 1L),
+  df2_pid %>% select(pid, all_of(derived_score_vars)) %>% mutate(wave_source = 2L),
+  df3_pid %>% select(pid, all_of(derived_score_vars)) %>% mutate(wave_source = 3L)
+)
+
+score_inconsistencies <- derived_scores_long %>%
+  group_by(pid) %>%
+  summarise(across(all_of(derived_score_vars), ~ n_distinct(.x, na.rm = TRUE)),
+            n_waves_present = n(), .groups = "drop") %>%
+  filter(n_waves_present > 1, if_any(all_of(derived_score_vars), ~ .x > 1))
+
+if (nrow(score_inconsistencies) > 0) {
+  warning(nrow(score_inconsistencies), " participant(s) have inconsistent derived scores across waves.")
+}
+
+derived_scores_by_pid <- derived_scores_long %>%
+  arrange(pid, wave_source) %>%
+  group_by(pid) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(pid, all_of(derived_score_vars))
+
+check_unique_pid(derived_scores_by_pid, "derived_scores_by_pid")
+
+stopifnot(nrow(derived_scores_by_pid) == length(unique(c(df1_pid$pid, df2_pid$pid, df3_pid$pid))))
+```
+
+## Building social-media and political-source indices
+
+`-77`/`-99` = missing codes, not unexpected values. `pol_source_*` recoding:
+confirmed via `table(pol_source_tv)` that 0 = not used, 1 = most-used rank,
+11 = least-used rank -- recoded as `12 - rank` (0 stays 0) so higher always
+means "more central to the media diet," consistent with every other index
+here.
+
+```{r media-binary-helper}
+to_binary_dummy <- function(x) {
+  x_chr <- str_trim(as.character(x))
+  out <- case_when(
+    x_chr == "quoted" ~ 1L,
+    x_chr == "not quoted" ~ 0L,
+    x_chr %in% c("1", "1.0") ~ 1L,
+    x_chr %in% c("0", "0.0") ~ 0L,
+    is.na(x_chr) | x_chr == "" | x_chr %in% survey_missing_codes ~ NA_integer_,
+    TRUE ~ NA_integer_
+  )
+  unexpected <- x_chr[!is.na(x_chr) & x_chr != "" & !(x_chr %in% survey_missing_codes) & is.na(out)]
+  if (length(unexpected) > 0) {
+    stop("Unexpected platform-dummy value(s): ", paste(unique(unexpected), collapse = ", "))
+  }
+  out
+}
+
+recode_source_rank <- function(x) if_else(x == 0, 0, 12 - x)
+```
+
+```{r media-indices}
+media_data <- participants_february_relevant %>%
+  mutate(across(all_of(c(socmed_platforms, socmed_pol_platforms)), to_binary_dummy)) %>%
+  mutate(
+    socmed_index = rowSums(across(all_of(socmed_platforms)), na.rm = TRUE),
+    socmed_pol_index = rowSums(across(all_of(socmed_pol_platforms)), na.rm = TRUE),
+    socmed_pol_any = as.integer(socmed_pol_index > 0)
+  ) %>%
+  mutate(across(all_of(pol_source_all_items), recode_source_rank, .names = "{.col}_strength")) %>%
+  mutate(
+    pol_source_n_used = rowSums(across(all_of(pol_source_all_items), ~ .x > 0)),
+
+    pol_source_primary = case_when(
+      pol_source_tv == 1 ~ "tv",
+      pol_source_tv_online == 1 ~ "tv_online",
+      pol_source_news == 1 ~ "news",
+      pol_source_news_online == 1 ~ "news_online",
+      pol_source_radio == 1 ~ "radio",
+      pol_source_radio_online == 1 ~ "radio_online",
+      pol_source_messenger == 1 ~ "messenger",
+      pol_source_socmed == 1 ~ "socmed",
+      pol_source_other_online == 1 ~ "other_online",
+      pol_source_conversation == 1 ~ "conversation",
+      pol_source_other == 1 ~ "other",
+      TRUE ~ NA_character_
+    ),
+
+    pol_source_offline_n_used = rowSums(
+      across(all_of(c("pol_source_tv", "pol_source_radio", "pol_source_news")), ~ .x > 0)
+    ),
+    pol_source_online_n_used = rowSums(
+      across(all_of(c("pol_source_tv_online", "pol_source_radio_online",
+                       "pol_source_news_online", "pol_source_other_online")), ~ .x > 0)
+    )
+  ) %>%
+  left_join(derived_scores_by_pid, by = "pid")
+
+pol_topics_agreement <- media_data %>%
+  mutate(topics_no_binary = to_binary_dummy(socmed_pol_topics_no)) %>%
+  filter(!is.na(socmed_pol_any), !is.na(topics_no_binary)) %>%
+  summarise(n_agree = sum((socmed_pol_any == 1) == (topics_no_binary == 0)), n = n())
+
+message(
+  "socmed_pol_any agrees with socmed_pol_topics_no in ",
+  pol_topics_agreement$n_agree, " of ", pol_topics_agreement$n, " rows."
+)
+```
+
+## Assembling the final dataset
+
+```{r media-assemble}
+final_media_political_vars <- c(
+  "pid",
+  "newsuse_online", "paperuse_no",
+  "socmed_index", "socmed_pol_index", "socmed_pol_any", "socmed_no",
+  "pol_source_n_used", "pol_source_primary",
+  "pol_source_offline_n_used", "pol_source_online_n_used",
+  "pol_source_socmed", "pol_source_messenger", "pol_source_conversation",
+  "pol_source_other", "pol_source_none",
+  "pol_debate", "pol_debate_online",
+  "pol_interest_general", "polknow_total", "pol_attitude",
+  all_of(attitude_party_items),
+  "internet_use_skill", "polpart_onl_total", "polpart_off_total", "self_pol_total",
+  "voting_decision_f", "voting_decision_y", "election_voted",
+  all_of(sociodemo_vars_t0)
+)
+
+participants_media_political <- media_data %>%
+  select(all_of(final_media_political_vars))
+
+check_unique_pid(participants_media_political, "participants_media_political")
+```
+
+## Saving, documenting, and merging in participation flags
+
+```{r media-save}
+saveRDS(participants_media_political, file.path(output_dir, "participants_media_political.rds"))
+
+message(
+  "Media/political/socio-demographic set completed.\n",
+  "Rows: ", nrow(participants_media_political), "\n",
+  "Columns (incl. pid): ", ncol(participants_media_political), "\n",
+  "Participants without a derived score (never in df1/df2/df3): ",
+  sum(is.na(participants_media_political$polknow_total))
+)
+```
+
+```{r media-overview}
+media_variable_overview <- tibble(
+  variable = final_media_political_vars[final_media_political_vars != "pid"]
+) %>%
+  mutate(
+    source = case_when(
+      variable %in% derived_score_vars ~ "derived_score_df1_df2_df3",
+      variable %in% sociodemo_vars_t0 ~ "raw_T0_sociodemographic",
+      variable %in% c("socmed_index", "socmed_pol_index", "socmed_pol_any",
+                      "pol_source_n_used", "pol_source_primary",
+                      "pol_source_offline_n_used", "pol_source_online_n_used") ~ "constructed_index",
+      TRUE ~ "raw_T0_media_political"
+    ),
+    already_aggregated_upstream = variable %in% c(
+      "polknow_total", "knowledge_politicians", "internet_use_skill",
+      "polpart_onl_total", "polpart_off_total", "self_pol_total",
+      "voting_decision_f", "voting_decision_y", "election_voted"
+    ),
+    matches_supplement_covariate = variable %in% c(
+      sociodemo_vars_t0, "pol_attitude", "pol_interest_general",
+      "polknow_total", "internet_use_skill", "newsuse_online", "voting_decision_y"
+    )
+  )
+
+write_csv(media_variable_overview, file.path(output_dir, "media_variable_overview.csv"))
+
+message("Saved media_variable_overview.csv to Output/00_setup with ",
+        nrow(media_variable_overview), " documented variables.")
+```
+
+Final merge: adds participation flags (`in_df1`/`in_df2`/`in_df3`,
+`in_experiment`, `n_experiment_waves`) and `group` from `pid_lookup_february`.
+
+```{r media-panelist-final}
+panelist_metadata_final <- participants_media_political %>%
+  left_join(pid_lookup_february, by = "pid")
+
+check_unique_pid(panelist_metadata_final, "panelist_metadata_final")
+stopifnot(nrow(panelist_metadata_final) == nrow(participants_media_political))
+
+saveRDS(panelist_metadata_final, file.path(output_dir, "panelist_metadata_final.rds"))
+
+message(
+  "panelist_metadata_final completed.\n",
+  "Rows: ", nrow(panelist_metadata_final), "\n",
+  "Columns: ", ncol(panelist_metadata_final), "\n",
+  "Saved to: Output/00_setup/panelist_metadata_final.rds"
+)
+```
+
+# Constructed Index Variables: Explanation and Interpretation
+
+| Variable | Construction | Interpretation |
+|---|---|---|
+| `socmed_index` | Sum of 20 platform-use dummies (`"quoted"`/`"not quoted"` -> 0/1) | Breadth of social media use, 0-20. Higher = more fragmented, multi-platform routine, *not* higher intensity on any one platform |
+| `socmed_pol_index` | Sum of 19 politically-motivated-use dummies | Breadth of platforms used specifically for political information, 0-19 |
+| `socmed_pol_any` | Binary: `socmed_pol_index > 0` | Coarse yes/no flag; cross-validated against `socmed_pol_topics_no` (agreement rate reported in `pol_topics_agreement`) |
+| `pol_source_n_used` | Count of the 11 ranked `pol_source_*` items with rank > 0 | Diversity of political-information-source repertoire, 0-11 |
+| `pol_source_primary` | Which item has rank == 1 | Respondent's single most-used source; `NA` if nothing ranked |
+| `pol_source_offline_n_used` / `pol_source_online_n_used` | Subtotals of `pol_source_n_used` by offline (TV/radio/newspaper) vs. online variants | Descriptive split within the *same* shared ranking -- not independent scales |
+
+**Why no separate offline/online mean index:** all eleven `pol_source_*`
+items share one ranking per person (confirmed via
+`table(pol_source_tv)`: 26.3% "0" = not used, 49.6% "1" = most-used, then
+sharply declining). Averaging raw ranks within an arbitrary subgroup is not
+interpretable, since ranks are constrained by how many sources a person
+ranked *in total* across all eleven options -- not just within one subgroup.
+The recoded `_strength` columns (`12 - rank`) are kept for transparency but
+not folded into a mean index in the final dataset.
+
+**Kept disaggregated, not indexed:**
+
+- `pol_source_socmed`, `pol_source_messenger` -- kept as raw ranked items,
+  still counted in `pol_source_n_used`/`pol_source_primary` like every
+  other source (they are part of the same ranking, excluding them would
+  distort both measures)
+- `attitude_cdu`/`csu`/`spd`/`afd`/`fdp`/`linke`/`gruene` -- averaging
+  across parties would cancel out the left-right signal that makes each
+  item useful as a control variable
+
+## Derived scores (merged in, not built here)
+
+`polknow_total`, `internet_use_skill`, `polpart_onl_total`,
+`polpart_off_total`, `self_pol_total`, `voting_decision_f`/`_y`,
+`pol_attitude`, `knowledge_politicians`, `election_voted`:
+
+- Computed by Kacperski et al. after the raw T0 survey (except
+  `election_voted`, a T0 question stored under a different name)
+- Exist only in `df1`/`df2`/`df3`, merged via `derived_scores_by_pid`
+  (earliest wave per participant)
+- `NA` for the 1,655 participants never in any experimental wave --
+  structural, not a data-quality issue

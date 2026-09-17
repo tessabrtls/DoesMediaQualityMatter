@@ -1,0 +1,7 @@
+Topic,Predictor,Estimate,SE,p,N
+Cannabis,exp_topic_uptake_yn,8.2849,1.7133,0.0,432
+Cannabis,effort_count,1.9538,0.233,0.0,432
+Cannabis,q_primary,-27.215,29.1657,0.3551,63
+Child support,exp_topic_uptake_yn,5.1681,2.295,0.025,359
+Child support,effort_count,0.8247,0.3488,0.0186,359
+Child support,q_primary,-5.6823,20.6877,0.7847,61

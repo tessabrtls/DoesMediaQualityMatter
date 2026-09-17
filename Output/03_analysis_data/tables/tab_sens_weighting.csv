@@ -1,0 +1,10 @@
+Topic,Weighting,Estimate,p,Sig,N
+Cannabis,duration,0.234,0.838,,76
+Cannabis,log,0.145,0.9,,76
+Cannabis,unweighted,0.054,0.962,,76
+Child support,duration,1.095,0.153,,81
+Child support,log,1.129,0.154,,81
+Child support,unweighted,1.105,0.167,,81
+Energy transition,duration,5.209,0.14,,22
+Energy transition,log,5.001,0.17,,22
+Energy transition,unweighted,4.743,0.197,,22

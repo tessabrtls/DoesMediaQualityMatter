@@ -1,0 +1,13 @@
+Topic,Tier,Threshold,MeanLabels,PctNone,PctAll
+Child support,generic,0.4,4.41,0.55,61.8
+Child support,issue,0.4,3.28,1.43,18.22
+Cannabis,generic,0.4,4.37,1.92,63.57
+Cannabis,issue,0.4,2.88,3.33,7.57
+Child support,generic,0.5,4.05,0.88,45.88
+Child support,issue,0.5,2.79,4.28,8.78
+Cannabis,generic,0.5,4.09,2.32,50.96
+Cannabis,issue,0.5,2.36,5.05,3.83
+Child support,generic,0.6,3.57,1.98,28.65
+Child support,issue,0.6,2.31,6.92,3.84
+Cannabis,generic,0.6,3.56,3.73,29.97
+Cannabis,issue,0.6,1.87,9.99,1.72

@@ -1,0 +1,1119 @@
+---
+title: "Experimental-Period Visits: Preparation, PC1, Uptake, and Quality Exposure"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+Builds the experimental-period visits table and the participant-level
+measures of uptake, effort and encountered quality.
+
+| Part | Step |
+|---|---|
+| 1--3 | Setup, inputs, raw value checks |
+| 4 | Restrict to `in_experiment` participants; recode wave and topic relevance |
+| 5 | Merge domain-level PC1 and the manually coded news flag |
+| 6 | Establish the information-period window and restrict to it |
+| 7--8 | Coverage by topic, category, wave, news definition and category set |
+| 9--10 | Uptake and effort at `pid` x `wave`; restrict to the analysis samples |
+| 11 | Duration distribution |
+| 12 | Quality exposure, three category sets x three weightings |
+| 13 | Save |
+
+Two visits tables are produced. `visits_exp_all` holds every tracked row of
+an `in_experiment` participant and is used only by the window diagnostics in
+Part 6. `visits_experimental` is the window-restricted table and is the input
+to every measure and every diagnostic from Part 7 onwards. Restriction to the
+analysis samples happens per measure, after aggregation.
+
+## Outputs
+
+| Object | Role |
+|---|---|
+| `visits_experimental_period_pc1.Rds` | Visits inside the information period, PC1-merged, both news flags |
+| `experimental_topic_uptake_by_wave.Rds` / `.csv` | Uptake and effort at `pid` x `wave`, analysis sample only |
+| `experimental_quality_by_wave.Rds` | Quality exposure at `pid` x `wave`, analysis sample only |
+| `uptake_agreement_vs_url_int_visits_yn.csv` | Reconstructed uptake against `url_int_visits_yn`, per participant-wave |
+| `quality_coverage_triage.csv` | Three-way coverage triage per participant-wave |
+| `uptake_duration_share_by_wave.png` | Distribution of the duration-weighted uptake share |
+| `duration_distribution_by_wave.png` | Duration of scored topic-relevant visits |
+| `diag0a_timestamp_spans.csv` | Hours between the four wave timestamps |
+| `diag0b_window_composition.csv` | Rows inside and outside the window, by relevance and score |
+| `diag0c_window_validation.csv` | Agreement with `url_int_visits_yn` under three candidate windows |
+| `diag0d_empty_cells_by_arm.csv` | Participant-waves without a tracked row in the window, by arm |
+| `diag1`--`diag3` `.csv` + `.png` | PC1 coverage by topic, category, and wave |
+| `diag4_news_definition_agreement.csv` | Externally classified vs. manually coded news, topic-relevant rows |
+| `diag5_exposure_coverage_by_wave.csv` | Coverage per wave, per news definition |
+| `diag5b_ladder_coverage_by_wave.csv` | Coverage per wave, per category set |
+| `diag5c_category_before_after_pc1.csv` | Topic-relevant visits per category, before and after the PC1 filter |
+
+## Construction rules
+
+| Element | Rule | Set in |
+|---|---|---|
+| Time window | `start_intervention` to `start_knowledge` | Part 6 |
+| Topic relevance | exactly `is_topic == 1` | Part 4 |
+| Uptake denominator | all in-window visits of the participant-wave | Part 9 |
+| Quality denominator | scored in-window visits only | Part 12 |
+| Missing uptake | coded `0` | Part 10 |
+| Missing quality | coded `NA` | Part 12 |
+| Primary category set | News, Government, Other | Part 1 |
+| Primary weighting | raw duration | Part 12 |
+| Sample restriction | after aggregation | Parts 10 and 12 |
+
+## News definitions
+
+Both flags are carried on the same rows with the same weights.
+
+| Definition | Variable | Level | Origin |
+|---|---|---|---|
+| Externally classified | `category == "News"` | Per visit | Supplied with the tracking data |
+| Manually coded | `is_news_corrected == TRUE` | Per domain | Coded in `01d` / `01e` |
+
+For domains outside the coded set, `is_news_corrected` falls back to the
+externally classified value.
+
+# Part 1: Setup
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+```
+
+```{r paths-config-data, include = FALSE}
+
+data_dir     <- "~/Desktop/Masterarbeit/Data"
+raw_visits_path  <- file.path(data_dir, "download-3/0100-url-visits-annotated-feb-and-may.csv")
+
+```
+
+```{r paths-config}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+#data_dir     <- ""
+
+visits_dir <- file.path(project_root, "Output", "01_visits")
+setup_dir  <- file.path(project_root, "Output", "00_setup")
+output_dir <- file.path(project_root, "Output", "02a_experimental_visits")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+#raw_visits_path  <- file.path(data_dir, "")
+domain_pc1_path  <- file.path(data_dir, "domain-pc1_with_de.csv")
+pid_lookup_path  <- file.path(setup_dir, "pid_lookup_february.Rds")
+news_lookup_path <- file.path(visits_dir, "is_news_corrected_lookup.csv")
+
+load(file.path(data_dir, "df1_final_ac.Rdata"))
+load(file.path(data_dir, "df2_final_ac.Rdata"))
+load(file.path(data_dir, "df3_final_ac.Rdata"))
+```
+
+Category sets are defined once and reused by the quality measures (Part 12)
+and the ladder diagnostic (Part 8). The primary set excludes Search.
+
+```{r config-category-sets}
+CATEGORY_SETS <- list(
+  primary = c("News", "Government", "Other"),
+  news    = c("News"),
+  all     = c("News", "Government", "Other", "Search")
+)
+
+SUFFIX_FOR <- c(primary = "", news = "_news", all = "_all")
+```
+
+Two weighted means, used for both uptake shares and quality scores. Both
+drop missing values and zero weights, and return `NA` when nothing is left.
+
+```{r helpers-weighting}
+weighted_mean_na <- function(x, w) {
+  keep <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  sum(x[keep] * w[keep]) / sum(w[keep])
+}
+
+weighted_mean_log_na <- function(x, w) weighted_mean_na(x, log1p(w))
+```
+
+The three coverage diagnostics share one shape: cross-tabulate a grouping
+variable against a coverage flag, express it within group, print, write, plot.
+
+```{r helpers-coverage}
+coverage_table <- function(df, group_var, flag_var = "has_pc1") {
+  df %>%
+    count(.data[[group_var]], .data[[flag_var]]) %>%
+    rename(group = 1, flag = 2) %>%
+    group_by(group) %>%
+    mutate(share_within_group = n / sum(n), n_total_group = sum(n)) %>%
+    ungroup()
+}
+
+coverage_plot <- function(tab, title, x_lab, flag_lab = "has_pc1", flip = FALSE) {
+  p <- ggplot(tab, aes(x = factor(group), y = share_within_group, fill = flag)) +
+    geom_col(position = "stack") +
+    geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = title, x = x_lab, y = "Share of rows", fill = flag_lab) +
+    theme_minimal()
+  if (flip) p + coord_flip() else p
+}
+
+save_diag <- function(tab, plot, name, width = 7, height = 5) {
+  write_csv(tab, file.path(output_dir, paste0(name, ".csv")))
+  ggsave(file.path(output_dir, paste0(name, ".png")), plot, width = width, height = height)
+  print(plot)
+}
+```
+
+# Part 2: Loading Inputs
+
+The raw file is URL-level and already carries a topic classifier
+(`is_topic`, `is_topic_manual`) and a `category` from a step outside this
+pipeline. `analysis_pids` is the analytical population: valid assignment,
+wave participation, non-missing pre/post attitude.
+
+`supplied_uptake` is built here rather than twice further down, because both
+the window validation in Part 6 and the verification in Part 10 need it. The
+columns are extracted as vectors: the wave files carry SPSS `labelled`
+attributes that `bind_rows()` refuses to combine.
+
+```{r load-inputs}
+visits_exp_raw <- read_csv(raw_visits_path, show_col_types = FALSE) %>%
+  mutate(p_id = as.character(p_id))
+
+experiment_pids <- readRDS(pid_lookup_path) %>%
+  mutate(pid = as.character(pid)) %>%
+  filter(in_experiment) %>%
+  pull(pid) %>%
+  unique()
+
+analysis_pids <- list(df1, df2, df3) %>%
+  imap_dfr(~ tibble(pid = as.character(.x$pid), wave = as.integer(.y))) %>%
+  distinct(pid, wave)
+
+supplied_uptake <- list(df1, df2, df3) %>%
+  imap_dfr(~ tibble(pid               = as.character(.x$pid),
+                    wave              = as.integer(.y),
+                    url_int_visits_yn = as.numeric(.x$url_int_visits_yn),
+                    intervention      = as.character(.x$group_f))) %>%
+  distinct(pid, wave, .keep_all = TRUE)
+
+stopifnot(nrow(supplied_uptake) == nrow(analysis_pids))
+
+cat("Raw rows:", nrow(visits_exp_raw),
+    "| in_experiment pids:", length(experiment_pids),
+    "| analysis participant-waves:", nrow(analysis_pids), "\n")
+analysis_pids %>% count(wave, name = "n") %>% print()
+```
+
+# Part 3: Raw Values Before Recoding
+
+Checked first so the recoding rules in Part 4 follow from the data rather
+than from assumption.
+
+| Check | Confirms |
+|---|---|
+| `p_id` vs. `experiment_pids` | Join key types are consistent |
+| `table(wave)` | `wave` holds topic labels, not an index -> regex recode |
+| `table(is_topic)` | `is_topic` is not strictly binary -> strict `== 1` rule |
+
+```{r diagnose-raw}
+cat("Unique pids in raw CSV:", n_distinct(visits_exp_raw$p_id),
+    "| not in the in_experiment set:",
+    length(setdiff(unique(visits_exp_raw$p_id), experiment_pids)), "\n\n")
+
+cat("Raw `wave` values:\n")
+print(table(visits_exp_raw$wave, useNA = "ifany"))
+
+cat("\nRaw `is_topic` values (only exact 1 counts as topic-relevant):\n")
+print(table(visits_exp_raw$is_topic, useNA = "ifany"))
+```
+
+# Part 4: Filtering and Recoding
+
+Produces `visits_exp_all`: every tracked row of an `in_experiment`
+participant, recoded but not yet window-restricted. The window is applied in
+Part 6, after the lookups are merged, so that the diagnostics there can
+compare scored rows inside and outside the window on the same footing.
+
+| Output column | Source | Logic |
+|---|---|---|
+| `pid` | `p_id` | rename |
+| `wave_topic_label` | `wave` | raw string kept as audit trail |
+| `wave` | `wave` | numeric prefix via `str_extract("^\\d+")` |
+| `is_topic_label` | `is_topic` | exactly `1` -> `topic_relevant`, else `not_topic_relevant` |
+
+```{r filter-and-recode}
+visits_exp_all <- visits_exp_raw %>%
+  filter(p_id %in% experiment_pids) %>%
+  transmute(
+    pid = p_id,
+    wave_topic_label = wave,
+    wave = as.integer(str_extract(as.character(wave), "^\\d+")),
+    group = Group,
+    enddevice, used_at, duration,
+    start_date, start_intervention, start_knowledge, end_date,
+    registered_domain = as.character(registered_domain),
+    is_topic, is_topic_manual, category, news_category,
+    is_topic_label = if_else(is_topic == 1, "topic_relevant",
+                             "not_topic_relevant", missing = "not_topic_relevant")
+  )
+
+# The window filter in Part 6 compares timestamps, so a silent character
+# column would compare lexically and pass without doing anything.
+stopifnot(all(map_lgl(
+  visits_exp_all[c("used_at", "start_date", "start_intervention",
+                   "start_knowledge", "end_date")],
+  ~ inherits(.x, "POSIXct"))))
+
+n_wave_na <- sum(is.na(visits_exp_all$wave))
+cat("Rows after filtering:", nrow(visits_exp_all),
+    "| wave == NA after recoding:", n_wave_na, "\n")
+
+if (n_wave_na > 0) print(table(visits_exp_all$wave_topic_label[is.na(visits_exp_all$wave)]))
+```
+
+# Part 5: Merging PC1 and the Manually Coded News Flag
+
+Both lookups are domain-level and de-duplicated before joining, so neither
+can fan out visit rows. `pc1` is read with an explicit column type: type
+inference returned `character` here, which propagated a non-numeric quality
+score into every downstream measure before the assertions below caught it.
+
+For domains outside the manual-review set the corrected flag falls back to
+the automated annotation, mirroring the `coalesce()` rule used on the
+habitual table in `01e`.
+
+The merge runs on `visits_exp_all`, before the window filter, so that
+`has_pc1` exists on the out-of-window rows too. Part 6 needs it to establish
+how much of the *scored* topic-relevant traffic the window removes.
+
+```{r merge-lookups}
+
+news_corrected <- read_csv(news_lookup_path, show_col_types = FALSE) %>%
+  mutate(domain = as.character(domain),
+         is_news_corrected = as.logical(is_news_corrected)) %>%
+  filter(!is.na(domain), domain != "") %>%
+  distinct(domain, .keep_all = TRUE) %>%
+  select(domain, is_news_corrected)
+
+cat("News lookup domains:", nrow(news_corrected),
+    "| flagged as news:", sum(news_corrected$is_news_corrected, na.rm = TRUE), "\n")
+
+domain_pc1 <- read_csv2(domain_pc1_path,
+                        col_types = cols(domain = col_character(),
+                                         pc1 = col_character(),
+                                         .default = col_guess())) %>%
+  # The file uses a comma decimal separator, which col_double() cannot parse.
+  mutate(pc1 = as.numeric(str_replace(pc1, ",", "."))) %>%
+  distinct(domain, .keep_all = TRUE) %>%
+  select(domain, pc1)
+
+stopifnot(is.numeric(domain_pc1$pc1))
+stopifnot(!any(duplicated(domain_pc1$domain)))
+# Catch a parsing failure here rather than three chunks later.
+stopifnot(sum(!is.na(domain_pc1$pc1)) > 0)
+stopifnot(all(is.na(domain_pc1$pc1) | (domain_pc1$pc1 >= 0 & domain_pc1$pc1 <= 1)))
+
+cat("Lookup domains:", nrow(domain_pc1),
+    "| with pc1:", sum(!is.na(domain_pc1$pc1)), "\n")
+
+
+# The join is not idempotent: re-running it on an already-merged table
+# produces pc1.x / pc1.y instead of pc1. Fail loudly rather than silently.
+stopifnot(!any(c("pc1", "is_news_corrected", "has_pc1") %in% names(visits_exp_all)))
+
+n_before <- nrow(visits_exp_all)
+
+visits_exp_all <- visits_exp_all %>%
+  left_join(domain_pc1, by = c("registered_domain" = "domain"),
+            relationship = "many-to-one") %>%
+  left_join(news_corrected, by = c("registered_domain" = "domain"),
+            relationship = "many-to-one") %>%
+  mutate(
+    has_pc1 = !is.na(pc1),
+    is_news_auto = !is.na(category) & category == "News",
+    is_news_corrected = coalesce(is_news_corrected, is_news_auto)
+  )
+
+stopifnot(nrow(visits_exp_all) == n_before)
+```
+
+# Part 6: The Information-Period Window
+
+The source file is not restricted to the information period, and the file
+carries four timestamps per participant-wave. This part identifies which pair
+delimits the period, quantifies what a restriction removes, compares three
+candidate windows against `url_int_visits_yn`, and applies the chosen window.
+
+## Which timestamps delimit the period
+
+```{r diag0a-timestamp-spans}
+diag0a <- visits_exp_all %>%
+  distinct(pid, wave, start_date, start_intervention, start_knowledge, end_date) %>%
+  filter(!is.na(wave)) %>%
+  mutate(
+    h_start_to_interv = as.numeric(difftime(start_intervention, start_date,        units = "hours")),
+    h_interv_to_know  = as.numeric(difftime(start_knowledge,    start_intervention, units = "hours")),
+    h_know_to_end     = as.numeric(difftime(end_date,           start_knowledge,    units = "hours")),
+    h_total           = as.numeric(difftime(end_date,           start_date,         units = "hours"))
+  ) %>%
+  group_by(wave) %>%
+  summarise(across(starts_with("h_"),
+                   list(median = ~ round(median(.x, na.rm = TRUE), 1),
+                        p90    = ~ round(quantile(.x, .9, na.rm = TRUE), 1)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop")
+
+cat("Hours between the four wave timestamps:\n")
+print(as.data.frame(diag0a))
+write_csv(diag0a, file.path(output_dir, "diag0a_timestamp_spans.csv"))
+```
+
+Median spans: `start_date` to `start_intervention` 0.2 h,
+`start_intervention` to `start_knowledge` 23.3--23.7 h,
+`start_knowledge` to `end_date` 0 h.
+
+## What the window removes
+
+```{r diag0b-window-composition}
+diag0b <- visits_exp_all %>%
+  filter(!is.na(wave)) %>%
+  mutate(window = case_when(
+    used_at <  start_intervention ~ "1 before intervention",
+    used_at <= start_knowledge    ~ "2 information period",
+    used_at <= end_date           ~ "3 after knowledge test",
+    TRUE                          ~ "4 after wave end")) %>%
+  group_by(wave, window) %>%
+  summarise(all_rows     = n(),
+            topic_rows   = sum(is_topic == 1, na.rm = TRUE),
+            scored_topic = sum(is_topic == 1 & has_pc1, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(wave) %>%
+  mutate(pct_scored = round(100 * scored_topic / sum(scored_topic), 1)) %>%
+  ungroup()
+
+cat("Rows by window position:\n")
+print(as.data.frame(diag0b))
+write_csv(diag0b, file.path(output_dir, "diag0b_window_composition.csv"))
+```
+
+Scored topic-relevant rows inside the period: 75.3 / 75.9 / 83.7 per cent.
+
+## Comparison of candidate windows
+
+Selection rule, fixed before the result: the window with the highest
+agreement against `url_int_visits_yn` and no `supplied only` cells.
+
+```{r diag0c-window-validation}
+WINDOWS <- list(
+  none        = function(d) d,
+  information = function(d) filter(d, used_at >= start_intervention,
+                                      used_at <= start_knowledge),
+  from_start  = function(d) filter(d, used_at >= start_date,
+                                      used_at <= end_date)
+)
+
+diag0c <- imap_dfr(WINDOWS, function(f, nm) {
+  f(visits_exp_all %>% filter(!is.na(wave))) %>%
+    group_by(pid, wave) %>%
+    summarise(recon = as.integer(any(is_topic == 1, na.rm = TRUE)), .groups = "drop") %>%
+    right_join(analysis_pids, by = c("pid", "wave")) %>%
+    mutate(recon = coalesce(recon, 0L)) %>%
+    left_join(supplied_uptake, by = c("pid", "wave")) %>%
+    filter(!is.na(url_int_visits_yn)) %>%
+    group_by(wave) %>%
+    summarise(pct_agree    = round(100 * mean(recon == url_int_visits_yn), 1),
+              n_recon_only = sum(recon == 1 & url_int_visits_yn == 0),
+              n_suppl_only = sum(recon == 0 & url_int_visits_yn == 1),
+              uptake_rate  = round(100 * mean(recon), 1),
+              .groups = "drop") %>%
+    mutate(window = nm)
+})
+
+cat("Agreement with url_int_visits_yn under three candidate windows:\n")
+diag0c %>%
+  pivot_wider(names_from = wave,
+              values_from = c(pct_agree, n_recon_only, n_suppl_only, uptake_rate)) %>%
+  as.data.frame() %>% print()
+
+write_csv(diag0c, file.path(output_dir, "diag0c_window_validation.csv"))
+```
+
+## Applying the window
+
+Agreement: 93.9 / 93.0 / 94.9 per cent under no filter, 96.9 / 96.2 / 96.9
+under `information`, 94.2 / 94.0 / 95.4 under `from_start`. No `supplied only`
+cells under any candidate. `information` is applied below.
+
+```{r apply-window}
+n_window_na <- visits_exp_all %>%
+  filter(!is.na(wave)) %>%
+  summarise(n = sum(is.na(start_intervention) | is.na(start_knowledge))) %>%
+  pull(n)
+
+# Stops if any participant-wave lacks a defined period; such rows would
+# otherwise be dropped by the filter and read as zero uptake.
+cat("Rows with an undefined information period:", n_window_na, "\n")
+stopifnot(n_window_na == 0)
+
+visits_experimental <- visits_exp_all %>%
+  filter(used_at >= start_intervention, used_at <= start_knowledge)
+
+cat("Rows before window filter:", nrow(visits_exp_all),
+    "| after:", nrow(visits_experimental),
+    "| retained:", round(100 * nrow(visits_experimental) / nrow(visits_exp_all), 1), "%\n")
+
+stopifnot(all(visits_experimental$used_at >= visits_experimental$start_intervention),
+          all(visits_experimental$used_at <= visits_experimental$start_knowledge))
+```
+
+# Part 7: PC1 Coverage by Topic, Category, and Wave
+
+All diagnostics from here on run on `visits_experimental`.
+
+```{r diagnostic-1}
+diag1 <- coverage_table(visits_experimental, "is_topic_label")
+print(diag1)
+save_diag(diag1, coverage_plot(diag1, "PC1 coverage by topic relevance", "is_topic"),
+          "diag1_topic_pc1_crosstab")
+```
+
+The saved category crosstab is unrestricted; only the plot is limited to the
+largest categories plus `News`, forced in so the chart always shows where
+News sits relative to them.
+
+```{r diagnostic-2}
+diag2 <- visits_experimental %>%
+  filter(!is.na(category)) %>%
+  coverage_table("category")
+
+print(diag2 %>% arrange(desc(n_total_group)))
+
+top_categories <- diag2 %>%
+  distinct(group, n_total_group) %>%
+  slice_max(n_total_group, n = 4) %>%
+  pull(group) %>%
+  union("News")
+
+save_diag(diag2, coverage_plot(diag2 %>% filter(group %in% top_categories),
+                               "PC1 coverage by category", "Category", flip = TRUE),
+          "diag2_category_pc1_crosstab", width = 8, height = 6)
+```
+
+Coverage inside the automated-News subset by wave. A low rate here directly
+caps how many participants can carry a quality exposure in that wave; the
+Wave 2 figure is the observed data limitation behind the small-sample caveat
+for the energy-transition topic, not a coding error.
+
+```{r diagnostic-3}
+diag3 <- visits_experimental %>%
+  filter(is_topic == 1, is_news_auto, !is.na(wave)) %>%
+  coverage_table("wave")
+
+print(diag3)
+save_diag(diag3, coverage_plot(diag3, "PC1 coverage in the News subset, by wave", "Wave"),
+          "diag3_analysis_subset_pc1_by_wave", width = 6, height = 5)
+```
+
+# Part 8: News Definitions and Category-Set Coverage
+
+Cross-tabulation of the two news definitions on topic-relevant rows.
+Off-diagonal cells are the visits the manual coding adds and removes.
+
+```{r diagnostic-4}
+diag4 <- visits_experimental %>%
+  filter(is_topic == 1) %>%
+  count(automated = is_news_auto, corrected = is_news_corrected) %>%
+  pivot_wider(names_from = corrected, values_from = n,
+              names_prefix = "corrected_", values_fill = 0L)
+
+print(diag4)
+write_csv(diag4, file.path(output_dir, "diag4_news_definition_agreement.csv"))
+```
+
+Participants per wave with a usable exposure, per news definition. The
+warning fires if the manually coded coverage falls below the externally
+classified coverage, which would indicate a failed domain join in Part 5.
+
+```{r diagnostic-5}
+exposure_coverage <- function(df, flag_var, label) {
+  df %>%
+    filter(is_topic == 1, .data[[flag_var]], has_pc1, !is.na(wave)) %>%
+    semi_join(analysis_pids, by = c("pid", "wave")) %>%
+    distinct(pid, wave) %>%
+    count(wave, name = "n_participants") %>%
+    mutate(definition = label)
+}
+
+diag5 <- bind_rows(
+  exposure_coverage(visits_experimental, "is_news_auto", "automated"),
+  exposure_coverage(visits_experimental, "is_news_corrected", "corrected")
+) %>%
+  pivot_wider(names_from = definition, values_from = n_participants, values_fill = 0L)
+
+print(diag5)
+write_csv(diag5, file.path(output_dir, "diag5_exposure_coverage_by_wave.csv"))
+
+if (any(diag5$corrected < diag5$automated)) {
+  warning("Corrected coverage falls below automated coverage in at least one wave. ",
+          "Check the registered_domain / domain join in Part 5.")
+}
+```
+
+The same count per category set, plus the category composition of the scored
+topic-relevant rows.
+
+```{r diagnostic-5b}
+ladder_coverage <- imap_dfr(CATEGORY_SETS, function(cats, set_name) {
+  visits_experimental %>%
+    filter(is_topic == 1, has_pc1, !is.na(wave), category %in% cats) %>%
+    semi_join(analysis_pids, by = c("pid", "wave")) %>%
+    distinct(pid, wave) %>%
+    count(wave, name = "n_participants") %>%
+    mutate(category_set = set_name)
+}) %>%
+  pivot_wider(names_from = wave, values_from = n_participants,
+              names_prefix = "wave_", values_fill = 0L)
+
+cat("Participants with a usable quality exposure, by category set and wave:\n")
+print(ladder_coverage)
+
+cat("\nCategory composition of scored topic-relevant rows, by wave:\n")
+visits_experimental %>%
+  filter(is_topic == 1, has_pc1, !is.na(wave)) %>%
+  semi_join(analysis_pids, by = c("pid", "wave")) %>%
+  count(wave, category) %>%
+  group_by(wave) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  print(n = Inf)
+
+write_csv(ladder_coverage, file.path(output_dir, "diag5b_ladder_coverage_by_wave.csv"))
+```
+
+Topic-relevant visits per category before and after the PC1 filter. The
+composition in the previous chunk is conditional on `has_pc1`; this one is
+not.
+
+```{r diagnostic-5c}
+diag5c <- visits_experimental %>%
+  filter(is_topic == 1, !is.na(wave)) %>%
+  semi_join(analysis_pids, by = c("pid", "wave")) %>%
+  group_by(wave, category) %>%
+  summarise(n_topic = n(),
+            n_scored = sum(has_pc1),
+            pct_scored = round(100 * mean(has_pc1), 1),
+            .groups = "drop") %>%
+  group_by(wave) %>%
+  mutate(share_of_topic = round(100 * n_topic / sum(n_topic), 1)) %>%
+  ungroup() %>%
+  arrange(wave, desc(n_topic))
+
+cat("Topic-relevant visits by category, before and after the PC1 filter:\n")
+print(as.data.frame(diag5c))
+
+write_csv(diag5c, file.path(output_dir, "diag5c_category_before_after_pc1.csv"))
+```
+
+Domains behind the government-category visits, with `in_lookup` indicating
+whether the domain occurs in the PC1 table at all. Separates absent ratings
+from a failed domain join.
+
+```{r diagnostic-5d}
+visits_experimental %>%
+  filter(is_topic == 1, category == "Government", !is.na(wave)) %>%
+  semi_join(analysis_pids, by = c("pid", "wave")) %>%
+  count(wave, registered_domain, has_pc1, sort = TRUE) %>%
+  group_by(wave) %>%
+  slice_max(n, n = 8) %>%
+  ungroup() %>%
+  mutate(in_lookup = registered_domain %in% domain_pc1$domain) %>%
+  as.data.frame() %>% print()
+```
+
+# Part 9: Topic Uptake and Effort
+
+Aggregated to `pid` x `wave` over all in-window rows, before sample
+restriction. Uptake is the union of topic-relevant URL and search visits; the
+two components are kept separately for the verification in Part 10.
+
+| Measure | Definition | Role |
+|---|---|---|
+| `exp_topic_uptake_yn` | At least one topic-relevant visit | Uptake (Eq. 3.1) |
+| `exp_topic_uptake_n` | Count of topic-relevant visits | Effort, primary (Eq. 3.2) |
+| `n_topic_domains` | Distinct topic-relevant domains | Effort, supplementary |
+| `topic_duration` | Seconds on topic-relevant visits | Effort, supplementary |
+| `exp_topic_uptake_dw` | Share of browsing time on topic-relevant visits | Duration-weighted uptake |
+
+`exp_topic_uptake_dw` is the duration-weighted mean of the binary `is_topic`
+indicator. Its denominator is all in-window visits of the participant-wave;
+the quality measures in Part 12 condition on scored visits instead.
+
+```{r topic-uptake}
+topic_uptake <- visits_experimental %>%
+  filter(!is.na(wave)) %>%
+  mutate(is_topic_bin = as.integer(is_topic == 1)) %>%
+  group_by(pid, wave) %>%
+  summarise(
+    n_visits_total         = n(),
+    exp_topic_uptake_n     = sum(is_topic_bin, na.rm = TRUE),
+    exp_topic_uptake_yn    = as.integer(any(is_topic_bin == 1, na.rm = TRUE)),
+    n_topic_search         = sum(is_topic_bin == 1 & category == "Search", na.rm = TRUE),
+    n_topic_url            = sum(is_topic_bin == 1 &
+                                   (category != "Search" | is.na(category)), na.rm = TRUE),
+    n_topic_domains        = n_distinct(registered_domain[is_topic_bin == 1 &
+                                                            !is.na(registered_domain)]),
+    total_duration         = sum(duration, na.rm = TRUE),
+    topic_duration         = sum(duration[is_topic_bin == 1], na.rm = TRUE),
+    exp_topic_uptake_dw    = weighted_mean_na(is_topic_bin, duration),
+    exp_topic_uptake_logdw = weighted_mean_log_na(is_topic_bin, duration),
+    .groups = "drop"
+  )
+
+# The two components must exhaust the union, without double counting.
+stopifnot(all(topic_uptake$n_topic_url + topic_uptake$n_topic_search ==
+                topic_uptake$exp_topic_uptake_n))
+# The binary flag must agree with a positive count.
+stopifnot(all((topic_uptake$exp_topic_uptake_n > 0) ==
+                (topic_uptake$exp_topic_uptake_yn == 1)))
+
+cat("Participant-wave cells before restriction:", nrow(topic_uptake), "\n")
+
+cat("\nRaw vs. log-duration-weighted uptake share, by wave:\n")
+topic_uptake %>%
+  filter(!is.na(exp_topic_uptake_dw), !is.na(exp_topic_uptake_logdw)) %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            r = round(cor(exp_topic_uptake_dw, exp_topic_uptake_logdw), 3),
+            mean_abs_diff = round(mean(abs(exp_topic_uptake_dw - exp_topic_uptake_logdw)), 5),
+            .groups = "drop") %>%
+  print()
+```
+
+# Part 10: Restricting to the Analysis Samples
+
+Reconciliation runs before restriction, while the surplus cells still exist.
+Surplus cells are participants tracked during a wave they did not take part
+in; the second output reports how many other waves they appear in.
+
+```{r uptake-reconciliation}
+recon <- topic_uptake %>%
+  full_join(analysis_pids %>% mutate(in_analysis = TRUE), by = c("pid", "wave")) %>%
+  mutate(in_uptake   = !is.na(exp_topic_uptake_yn),
+         in_analysis = coalesce(in_analysis, FALSE))
+
+cat("Uptake cells vs. wave analysis samples:\n")
+recon %>% count(wave, in_uptake, in_analysis) %>% print()
+
+cat("\nSurplus cells: number of other waves these participants appear in\n")
+recon %>%
+  filter(in_uptake, !in_analysis) %>%
+  distinct(pid) %>%
+  inner_join(analysis_pids, by = "pid") %>%
+  count(pid) %>%
+  count(n, name = "n_participants") %>%
+  rename(n_other_waves = n) %>%
+  print()
+```
+
+The window filter can leave a participant-wave with no tracked rows, and
+therefore with no uptake cell. Those cells are restored through a left join
+and coded as zero uptake.
+
+```{r uptake-restrict}
+UPTAKE_ZERO <- c(n_visits_total = 0, exp_topic_uptake_n = 0, exp_topic_uptake_yn = 0,
+                 n_topic_search = 0, n_topic_url = 0, n_topic_domains = 0,
+                 total_duration = 0, topic_duration = 0)
+
+topic_uptake <- analysis_pids %>%
+  left_join(topic_uptake, by = c("pid", "wave")) %>%
+  mutate(across(all_of(names(UPTAKE_ZERO)), ~ coalesce(.x, 0)),
+         across(c(exp_topic_uptake_n, exp_topic_uptake_yn, n_topic_search,
+                  n_topic_url, n_topic_domains, n_visits_total), as.integer))
+
+n_empty <- sum(topic_uptake$n_visits_total == 0)
+cat("Participant-waves with no tracked rows inside the window:", n_empty, "\n")
+
+stopifnot(nrow(topic_uptake) == nrow(analysis_pids))
+stopifnot(!any(duplicated(topic_uptake[c("pid", "wave")])))
+
+cat("Uptake after restriction:\n")
+topic_uptake %>%
+  group_by(wave) %>%
+  summarise(n_cells        = n(),
+            n_uptake_yes   = sum(exp_topic_uptake_yn),
+            pct_uptake_yes = round(100 * mean(exp_topic_uptake_yn), 1),
+            .groups = "drop") %>%
+  print()
+
+write_csv(topic_uptake, file.path(output_dir, "experimental_topic_uptake_by_wave.csv"))
+saveRDS(topic_uptake, file.path(output_dir, "experimental_topic_uptake_by_wave.Rds"))
+```
+
+```{r uptake-plot, fig.width=10, fig.height=4}
+p_uptake <- topic_uptake %>%
+  filter(exp_topic_uptake_dw > 0) %>%
+  ggplot(aes(x = exp_topic_uptake_dw)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~ wave, nrow = 1, labeller = label_both) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(title = "Share of experimental-period browsing time on topic-relevant visits",
+       subtitle = "Participant-waves with non-zero uptake only",
+       x = "Duration-weighted uptake share", y = "Participant-waves") +
+  theme_minimal()
+
+print(p_uptake)
+ggsave(file.path(output_dir, "uptake_duration_share_by_wave.png"), p_uptake, width = 10, height = 4)
+```
+
+## Verification against `url_int_visits_yn`
+
+`url_int_visits_yn` excludes search-engine pages; the reconstruction is the
+union of URL and search visits. The outputs quantify the disagreement, split
+it by component, and report it by arm.
+
+```{r uptake-agreement}
+agreement <- topic_uptake %>%
+  inner_join(supplied_uptake, by = c("pid", "wave")) %>%
+  mutate(
+    supplied      = as.integer(url_int_visits_yn),
+    reconstructed = as.integer(exp_topic_uptake_yn),
+    # The variant that should match the documented construction of the
+    # supplied variable: same union, search visits removed.
+    reconstructed_nosearch = as.integer(n_topic_url > 0),
+    status = case_when(
+      supplied == reconstructed          ~ "agree",
+      supplied == 0 & reconstructed == 1 ~ "reconstructed only",
+      supplied == 1 & reconstructed == 0 ~ "supplied only"
+    )
+  )
+
+stopifnot(nrow(agreement) == nrow(topic_uptake))
+
+cat("Agreement, reconstructed (incl. search) vs. url_int_visits_yn:\n")
+agreement %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            pct_agree    = round(100 * mean(status == "agree"), 1),
+            n_recon_only = sum(status == "reconstructed only"),
+            n_suppl_only = sum(status == "supplied only"),
+            .groups = "drop") %>%
+  print()
+
+# Agreement with and without search visits, to attribute the disagreement.
+cat("\nAgreement with and without search visits in the reconstruction:\n")
+agreement %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            pct_agree_with_search = round(100 * mean(supplied == reconstructed), 1),
+            pct_agree_no_search   = round(100 * mean(supplied == reconstructed_nosearch), 1),
+            .groups = "drop") %>%
+  print()
+
+cat("\nComposition of 'reconstructed only' cells:\n")
+agreement %>%
+  filter(status == "reconstructed only") %>%
+  mutate(component = case_when(
+    n_topic_url == 0 & n_topic_search >  0 ~ "search visits only",
+    n_topic_url >  0 & n_topic_search == 0 ~ "URL visits only",
+    TRUE                                   ~ "both"
+  )) %>%
+  count(wave, component) %>%
+  print(n = Inf)
+
+# Cells where the supplied variable finds uptake and the reconstruction does
+# not. n_zero_tracked_rows separates tracking gaps from classification gaps.
+cat("\nComposition of 'supplied only' cells:\n")
+agreement %>%
+  filter(status == "supplied only") %>%
+  summarise(n = n(),
+            median_visits_total = median(n_visits_total),
+            n_zero_tracked_rows = sum(n_visits_total == 0)) %>%
+  print()
+
+# Agreement and both uptake rates by arm.
+cat("\nAgreement by wave and condition:\n")
+agreement %>%
+  group_by(wave, intervention) %>%
+  summarise(n = n(),
+            pct_agree          = round(100 * mean(status == "agree"), 1),
+            rate_supplied      = round(100 * mean(supplied), 1),
+            rate_reconstructed = round(100 * mean(reconstructed), 1),
+            .groups = "drop") %>%
+  print(n = Inf)
+
+write_csv(
+  agreement %>% select(pid, wave, intervention, supplied, reconstructed,
+                       reconstructed_nosearch, n_topic_url, n_topic_search, status),
+  file.path(output_dir, "uptake_agreement_vs_url_int_visits_yn.csv"))
+```
+
+Participant-waves without a tracked row inside the window, by arm.
+
+```{r diagnostic-0d}
+armcheck <- topic_uptake %>%
+  left_join(supplied_uptake %>% select(pid, wave, intervention),
+            by = c("pid", "wave")) %>%
+  group_by(wave, intervention) %>%
+  summarise(n = n(),
+            n_empty = sum(n_visits_total == 0),
+            pct = round(100 * mean(n_visits_total == 0), 1),
+            .groups = "drop")
+
+cat("Participant-waves with no tracked rows inside the window, by arm:\n")
+print(as.data.frame(armcheck))
+
+write_csv(armcheck, file.path(output_dir, "diag0d_empty_cells_by_arm.csv"))
+```
+
+# Part 11: Duration Distribution
+
+Duration of the scored topic-relevant visits that enter the primary quality
+measure, checked before that measure is built. Reported with thresholds at
+10, 30 and 60 minutes and with the share of a participant-wave's topic time
+carried by its longest visit.
+
+```{r duration-distribution}
+dur_check <- visits_experimental %>%
+  filter(is_topic == 1, has_pc1, !is.na(wave), category %in% CATEGORY_SETS$primary) %>%
+  semi_join(analysis_pids, by = c("pid", "wave"))
+
+cat("Duration of scored topic-relevant visits (seconds):\n")
+dur_check %>%
+  summarise(n = n(),
+            min = min(duration), p25 = quantile(duration, .25),
+            median = median(duration), p75 = quantile(duration, .75),
+            p95 = quantile(duration, .95), p99 = quantile(duration, .99),
+            max = max(duration), n_zero = sum(duration == 0)) %>%
+  as.data.frame() %>% print()
+
+cat("\nVisits above plausible reading thresholds:\n")
+dur_check %>%
+  summarise(n = n(),
+            over_10min = sum(duration > 600),
+            over_30min = sum(duration > 1800),
+            over_1h    = sum(duration > 3600),
+            pct_over_30min = round(100 * mean(duration > 1800), 2),
+            share_time_over_30min =
+              round(100 * sum(duration[duration > 1800]) / sum(duration), 1)) %>%
+  as.data.frame() %>% print()
+
+# Restricted to participant-waves with at least two scored visits; the
+# single-visit cases would otherwise enter with a top share of 100 per cent
+# and are counted separately in Part 12.
+cat("\nShare of a participant-wave's topic time in its longest visit:\n")
+dur_check %>%
+  group_by(pid, wave) %>%
+  filter(n() >= 2) %>%
+  summarise(top_share = max(duration) / sum(duration), .groups = "drop") %>%
+  group_by(wave) %>%
+  summarise(n_participants = n(),
+            median_top_share = round(median(top_share), 3),
+            pct_over_50 = round(100 * mean(top_share > .5), 1),
+            pct_over_80 = round(100 * mean(top_share > .8), 1),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+```{r duration-plot, fig.width=10, fig.height=4}
+p_dur <- dur_check %>%
+  filter(duration > 0) %>%
+  ggplot(aes(x = duration)) +
+  geom_histogram(bins = 60, fill = "steelblue", alpha = .7) +
+  geom_vline(xintercept = 1800, linetype = "dashed", colour = "firebrick") +
+  scale_x_log10(labels = scales::comma) +
+  facet_wrap(~ wave, nrow = 1, labeller = label_both) +
+  labs(title = "Duration of scored topic-relevant visits (log scale)",
+       subtitle = "Dashed line at 30 minutes",
+       x = "Duration (seconds, log scale)", y = "Visits") +
+  theme_minimal()
+
+print(p_dur)
+ggsave(file.path(output_dir, "duration_distribution_by_wave.png"), p_dur, width = 10, height = 4)
+```
+
+# Part 12: Quality Exposure
+
+At `pid` x `wave`: three category sets (Part 1) x three weightings. The
+primary measure is `exp_q_dur`.
+
+| Variable | Weighting | Role |
+|---|---|---|
+| `exp_q_dur` | duration | Primary |
+| `exp_q_unw` | equal per visit | Sensitivity |
+| `exp_q_log` | log1p(duration) | Sensitivity |
+
+Suffix `_news` is the News-only set, `_all` includes Search, no suffix is the
+primary set. A participant-wave without a scored visit in a given set
+receives `NA`, never 0.
+
+```{r quality-exposure-build}
+build_quality <- function(cats, set_name) {
+  suffix <- SUFFIX_FOR[[set_name]]
+  visits_experimental %>%
+    filter(is_topic == 1, has_pc1, !is.na(wave), category %in% cats) %>%
+    semi_join(analysis_pids, by = c("pid", "wave")) %>%
+    group_by(pid, wave) %>%
+    summarise(
+      n_scored  = n(),
+      n_domains = n_distinct(registered_domain),
+      dur       = weighted_mean_na(pc1, duration),
+      unw       = mean(pc1, na.rm = TRUE),
+      log       = weighted_mean_log_na(pc1, duration),
+      .groups   = "drop"
+    ) %>%
+    rename_with(~ paste0("exp_q_", .x, suffix), c(dur, unw, log)) %>%
+    rename_with(~ paste0(.x, suffix), c(n_scored, n_domains))
+}
+
+# Left join onto the analysis sample so participants without a scored visit
+# appear as NA rather than being dropped.
+quality_exposure <- analysis_pids %>%
+  left_join(
+    Reduce(function(a, b) full_join(a, b, by = c("pid", "wave")),
+           imap(CATEGORY_SETS, build_quality)),
+    by = c("pid", "wave"))
+
+stopifnot(nrow(quality_exposure) == nrow(analysis_pids))
+
+cat("Participants with a usable quality score, by set and wave:\n")
+quality_exposure %>%
+  group_by(wave) %>%
+  summarise(n_cells = n(),
+            primary     = sum(!is.na(exp_q_dur)),
+            news_only   = sum(!is.na(exp_q_dur_news)),
+            incl_search = sum(!is.na(exp_q_dur_all)),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+
+cat("\nDistribution of the primary measure, by wave:\n")
+quality_exposure %>%
+  filter(!is.na(exp_q_dur)) %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            median = round(median(exp_q_dur), 3),
+            mean   = round(mean(exp_q_dur), 3),
+            sd     = round(sd(exp_q_dur), 3),
+            min    = round(min(exp_q_dur), 3),
+            max    = round(max(exp_q_dur), 3),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+Three groups: no topic-relevant activity, activity without a scored domain,
+and at least one scored domain.
+
+```{r quality-triage}
+triage <- topic_uptake %>%
+  select(pid, wave, exp_topic_uptake_yn) %>%
+  left_join(quality_exposure %>% select(pid, wave, exp_q_dur), by = c("pid", "wave")) %>%
+  mutate(group = case_when(
+    exp_topic_uptake_yn == 0 ~ "1: no topic-relevant activity",
+    is.na(exp_q_dur)         ~ "2: activity, no scored domain",
+    TRUE                     ~ "3: at least one scored domain"
+  ))
+
+triage %>%
+  count(wave, group) %>%
+  group_by(wave) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  as.data.frame() %>% print()
+
+write_csv(triage, file.path(output_dir, "quality_coverage_triage.csv"))
+```
+
+Correlation between the three weightings, and the number of scored visits and
+distinct domains behind each primary score.
+
+```{r quality-weighting-agreement}
+cat("Agreement between weightings, primary category set:\n")
+quality_exposure %>%
+  filter(!is.na(exp_q_dur)) %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            r_dur_unw = round(cor(exp_q_dur, exp_q_unw, use = "complete.obs"), 3),
+            r_dur_log = round(cor(exp_q_dur, exp_q_log, use = "complete.obs"), 3),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+
+cat("\nScored visits behind each primary score:\n")
+quality_exposure %>%
+  filter(!is.na(exp_q_dur)) %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            median_visits  = median(n_scored),
+            pct_single     = round(100 * mean(n_scored == 1), 1),
+            pct_two_orless = round(100 * mean(n_scored <= 2), 1),
+            median_domains = median(n_domains),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+Coverage and dispersion of the primary measure with and without the single
+domain that carries most of the scored government visits, plus the most
+frequent scored domains per wave.
+
+```{r quality-domain-concentration}
+DROP_DOMAIN <- "bundesgesundheitsministerium.de"
+
+q_without <- visits_experimental %>%
+  filter(is_topic == 1, has_pc1, !is.na(wave),
+         category %in% CATEGORY_SETS$primary,
+         registered_domain != DROP_DOMAIN) %>%
+  semi_join(analysis_pids, by = c("pid", "wave")) %>%
+  group_by(pid, wave) %>%
+  summarise(q_excl = weighted_mean_na(pc1, duration), .groups = "drop")
+
+quality_exposure %>%
+  select(pid, wave, q_incl = exp_q_dur) %>%
+  full_join(q_without, by = c("pid", "wave")) %>%
+  group_by(wave) %>%
+  summarise(n_incl   = sum(!is.na(q_incl)),
+            n_excl   = sum(!is.na(q_excl)),
+            sd_incl  = round(sd(q_incl, na.rm = TRUE), 4),
+            sd_excl  = round(sd(q_excl, na.rm = TRUE), 4),
+            mean_incl = round(mean(q_incl, na.rm = TRUE), 3),
+            mean_excl = round(mean(q_excl, na.rm = TRUE), 3),
+            r        = round(cor(q_incl, q_excl, use = "complete.obs"), 3),
+            .groups  = "drop") %>%
+  as.data.frame() %>% print()
+
+# Most frequent scored domains per wave, with their share of scored rows.
+visits_experimental %>%
+  filter(is_topic == 1, has_pc1, !is.na(wave),
+         category %in% CATEGORY_SETS$primary) %>%
+  semi_join(analysis_pids, by = c("pid", "wave")) %>%
+  count(wave, registered_domain, sort = TRUE) %>%
+  group_by(wave) %>%
+  mutate(share = round(100 * n / sum(n), 1)) %>%
+  slice_max(n, n = 5) %>%
+  ungroup() %>%
+  as.data.frame() %>% print()
+```
+
+# Part 13: Saving
+
+```{r save-final}
+saveRDS(quality_exposure, file.path(output_dir, "experimental_quality_by_wave.Rds"))
+#write_csv(quality_exposure, file.path(output_dir, "experimental_quality_by_wave.csv"))
+
+saveRDS(visits_experimental, file.path(output_dir, "visits_experimental_period_pc1.Rds"))
+#write_csv(visits_experimental, file.path(output_dir, "visits_experimental_period_pc1.csv"))
+
+cat("Saved:", nrow(visits_experimental), "visits |",
+    nrow(topic_uptake), "participant-waves (uptake) |",
+    nrow(quality_exposure), "participant-waves (quality)\n")
+```
+

@@ -1,0 +1,536 @@
+---
+title: "App Visits and News-App-to-Domain Mapping"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+Covers in-app browsing: building the `app_visits` table and preparing a
+manual news-app-to-domain mapping workbook. Both read the same raw input
+(`app_metadata.csv`, `mobile_views.csv`); mobile *web* browsing is covered
+separately.
+
+| Part | Does |
+|---|---|
+| 1 | Builds the `app_visits` table used later in the pipeline, with app metadata already deduplicated and aligned |
+| 2 | Prepares an editable Excel workbook for **manual** app-to-domain coding; touches no visit-level data |
+| 3 | Checks whether a traffic-based Top-N view of apps (independent of app-store category) would surface anything Part 2's category filter missed |
+
+## Outputs
+
+| Object | Part | Type | Role |
+|---|---|---|---|
+| `app_metadata_lookup.Rds` / `.RData` | 1 | Metadata, one row per `app_id` | `app_id`, `app_n`, `app_cat`, plus alignment audit columns; both inconsistency directions already resolved |
+| `app_id_alignment_log.Rds` / `.RData` | 1 | Diagnostic, one row per aligned group | Documents exactly which `app_id`s were aligned to which representative name/category |
+| `app_visits.Rds` / `.RData` | 1 | Visit-level, in-app only | `pid`, `app_id`, `used_at`, `duration`, `app_n`, `app_cat`; feeds into later visit-level processing |
+| `app_news_lookup_needs_domain_mapping.xlsx` | 2 | Editable workbook | One row per candidate news app, for manual publisher-domain coding; joined back in later, when habitual media quality is constructed |
+
+## Why apps and web visits stay separate
+
+- A mobile visit row is either **web** (has a `domain`) or **app** (has an
+  `app_id`), never both.
+- Domain-level quality scoring (PC1, MBFC) needs a registered domain; an
+  app has no domain by default.
+- Two-stage approach instead of guessing a domain from the app name:
+  1. Isolate app visits cleanly (Part 1)
+  2. Manually decide which apps map to a real news-publisher domain (Part 2)
+- Readers, browsers, aggregators, and platforms are excluded in Part 2, not
+  force-mapped to a domain.
+
+# Part 1: Building `app_visits`
+
+## Setup
+
+Filters to valid panel participants right after import, via the same
+`pid_lookup_february` reference from the setup stage.
+
+```{r libraries}
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+```
+
+```{r paths-and-helper, include=FALSE}
+
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+code_dir <- file.path(project_root, "Code")
+pid_dir <- file.path(project_root, "Output", "00_setup")
+output_dir <- file.path(project_root, "Output", "01_visits")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Saves as .Rds (readRDS() reuse) and .RData (load(), object under its own
+# name, matching how df1/df2/df3 are loaded elsewhere).
+save_both <- function(obj, name, dir = output_dir) {
+  assign(name, obj)
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  save(list = name, file = file.path(dir, paste0(name, ".RData")))
+  message("Saved ", name)
+}
+```
+
+```{r valid-pids}
+pid_lookup_february <- readRDS(file.path(pid_dir, "pid_lookup_february.Rds"))
+valid_pids <- as.character(pid_lookup_february$pid)
+```
+
+## Raw file paths
+
+Only batches from 1 April 2023 onward have `app_id`-bearing exports in this
+format, so this path list is shorter than the full web/mobile lists used
+elsewhere.
+
+```{r files, include=FALSE}
+mobile_visit_paths <- c(
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-04-01-to-2023-04-15-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/fixed/2023-04-15-to-2023-05-01-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-05-01-to-2023-05-15-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-05-15-to-2023-06-01-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-06-01-to-2023-06-15-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-06-15-to-2023-07-01-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-07-01-to-2023-07-15-exports/mobile_views.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-07-15-to-2023-08-01-exports/mobile_views.csv"
+) |> unique()
+
+app_metadata_paths <- c(
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-04-01-to-2023-04-15-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/fixed/2023-04-15-to-2023-05-01-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-05-01-to-2023-05-15-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-05-15-to-2023-06-01-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-06-01-to-2023-06-15-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-06-15-to-2023-07-01-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-07-01-to-2023-07-15-exports/app_metadata.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-07-15-to-2023-08-01-exports/app_metadata.csv"
+) |> unique()
+
+
+missing_mobile_files <- mobile_visit_paths[!file.exists(mobile_visit_paths)]
+missing_app_metadata_files <- app_metadata_paths[!file.exists(app_metadata_paths)]
+
+if (length(missing_mobile_files) > 0) {
+  stop("Missing mobile_views files:\n", paste(missing_mobile_files, collapse = "\n"))
+}
+if (length(missing_app_metadata_files) > 0) {
+  stop("Missing app_metadata files:\n", paste(missing_app_metadata_files, collapse = "\n"))
+}
+```
+
+```{r file-paths, include=TRUE}
+#mobile_visit_paths <- c() |> unique()
+
+#app_metadata_paths <- c() |> unique()
+
+#missing_mobile_files <- mobile_visit_paths[!file.exists(mobile_visit_paths)]
+#missing_app_metadata_files <- app_metadata_paths[!file.exists(app_metadata_paths)]
+
+#if (length(missing_mobile_files) > 0) {
+#  stop("Missing mobile_views files:\n", paste(missing_mobile_files, collapse = "\n"))
+#}
+#if (length(missing_app_metadata_files) > 0) {
+#  stop("Missing app_metadata files:\n", paste(missing_app_metadata_files, collapse = "\n"))
+#}
+```
+
+## Robust file-reading helper
+
+Same delimiter-detection-with-fallback used elsewhere in the pipeline: auto
+detect, retry with `;` if only 1 column results, fall back to plain CSV on
+error.
+
+```{r read-helper}
+read_raw_file <- function(file_path) {
+  message("Reading: ")
+  df <- tryCatch({
+    tmp <- read_delim(file_path, delim = NULL, show_col_types = FALSE, progress = FALSE)
+    if (ncol(tmp) == 1) {
+      tmp <- read_delim(file_path, delim = ";", show_col_types = FALSE, progress = FALSE)
+    }
+    tmp
+  }, error = function(e) {
+    read_csv(file_path, show_col_types = FALSE, progress = FALSE)
+  })
+  df %>% mutate(source_file = file_path)
+}
+```
+
+## Isolating app visits from the mobile export
+
+The mobile export mixes web visits (`domain`) and app visits (`app_id`) in
+one file. "App visit" here means non-missing `app_id`, restricted to valid
+panel participants immediately, so invalid `pid`s never carry further
+downstream.
+
+```{r isolate-app-visits, include=FALSE}
+mobile_views_raw <- map_dfr(mobile_visit_paths, read_raw_file)
+
+if ("p_id" %in% names(mobile_views_raw) && !"pid" %in% names(mobile_views_raw)) {
+  mobile_views_raw <- mobile_views_raw %>% rename(pid = p_id)
+}
+
+required_cols <- c("pid", "app_id", "used_at", "duration")
+missing_cols <- setdiff(required_cols, names(mobile_views_raw))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "mobile_views is missing required column(s): ", paste(missing_cols, collapse = ", "),
+    "\nColumns found: ", paste(names(mobile_views_raw), collapse = ", ")
+  )
+}
+
+app_visits_raw <- mobile_views_raw %>%
+  mutate(pid = as.character(pid), app_id = as.character(app_id)) %>%
+  filter(!is.na(app_id), app_id != "") %>%
+  filter(pid %in% valid_pids) %>%
+  select(pid, app_id, used_at, duration)
+
+unique_app_ids_observed <- unique(app_visits_raw$app_id)
+```
+
+```{r}
+cat("Rows in mobile_views (total):", nrow(mobile_views_raw), "\n")
+cat("Rows identified as app visits (valid pids only):", nrow(app_visits_raw), "\n")
+cat("Unique pids with >=1 app visit:", n_distinct(app_visits_raw$pid), "\n")
+cat("Unique app_ids observed:", n_distinct(app_visits_raw$app_id), "\n")
+```
+
+## Attaching descriptive app metadata
+
+Purely descriptive at this stage: `app_n` (name) and `app_cat` (Bilendi's
+App/Play Store category), not a domain mapping. Two independent
+inconsistency directions are resolved here, before `app_metadata_lookup`
+is saved, since both conflicts already exist at the metadata level,
+regardless of whether a given `app_id` ever had a visit:
+
+- **Direction 1, one `app_id`, several competing metadata values** across
+  export batches. Resolved first: keep only the most frequently observed
+  `app_n`/`app_cat` combination per `app_id`.
+- **Direction 2, several `app_id`s, one shared app name** (typically an
+  iOS and an Android build). Resolved second: every `app_id` in such a
+  group gets its `app_n`/`app_cat` overwritten with one shared,
+  group-level value, chosen by preferring
+  `"News, Media & Publications"` if any `app_id` in the group already
+  carries that category, falling back to the alphanumerically first
+  `app_id` otherwise.
+
+Critically, `app_metadata_lookup` keeps **one row per original `app_id`**
+throughout -- direction 2 aligns values across rows, it does not collapse
+them into fewer rows. The join below (`app_visits_raw %>%
+left_join(app_metadata_lookup, by = "app_id")`) must find a match for
+every `app_id` that ever had a visit; collapsing rows here would silently
+drop the metadata for every `app_id` other than the chosen representative.
+
+```{r attach-metadata, include=FALSE}
+app_metadata_raw <- map_dfr(app_metadata_paths, read_raw_file)
+
+required_app_columns <- c("app_id", "app_n", "app_cat")
+missing_app_columns <- setdiff(required_app_columns, names(app_metadata_raw))
+
+if (length(missing_app_columns) > 0) {
+  stop(
+    "app_metadata is missing required column(s): ", paste(missing_app_columns, collapse = ", "),
+    "\nColumns found: ", paste(names(app_metadata_raw), collapse = ", ")
+  )
+}
+
+news_category_regex <- regex("^News,\\s*Media\\s*&\\s*Publications$", ignore_case = TRUE)
+
+## Direction 1: one app_id, several competing metadata values across
+## export batches -- keep only the most frequently observed combination.
+## One row per app_id, unchanged in row count from app_metadata_raw's
+## distinct app_ids.
+app_metadata_by_id <- app_metadata_raw %>%
+  mutate(
+    app_id = as.character(app_id),
+    app_n = str_squish(as.character(app_n)),
+    app_cat = str_squish(as.character(app_cat))
+  ) %>%
+  filter(!is.na(app_id), app_id != "") %>%
+  count(app_id, app_n, app_cat, name = "n_occurrences") %>%
+  group_by(app_id) %>%
+  slice_max(n_occurrences, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(app_id, app_n, app_cat)
+
+n_app_ids_before_direction1 <- app_metadata_raw %>%
+  mutate(app_id = as.character(app_id)) %>%
+  filter(!is.na(app_id), app_id != "") %>%
+  n_distinct()
+
+cat("Unique app_ids before direction-1 resolution:", n_app_ids_before_direction1, "\n")
+cat("Unique app_ids after direction-1 resolution:", nrow(app_metadata_by_id), "\n")
+cat("Confirms exactly one row per app_id:",
+    n_app_ids_before_direction1 == nrow(app_metadata_by_id), "\n")
+
+## Direction 2: several app_ids, one shared name. Uses mutate(), not
+## summarise(), within each group -- every original app_id keeps its own
+## row, only app_n/app_cat are overwritten with the group's chosen value.
+## Row count of app_metadata_lookup therefore still equals
+## nrow(app_metadata_by_id).
+app_metadata_lookup <- app_metadata_by_id %>%
+  mutate(
+    app_group_key = str_squish(str_to_lower(app_n)),
+    is_news_cat = str_detect(app_cat, news_category_regex)
+  ) %>%
+  arrange(app_group_key, desc(is_news_cat), app_id) %>%
+  group_by(app_group_key) %>%
+  mutate(
+    app_n = first(app_n),
+    app_cat = first(app_cat),
+    representative_app_id = first(app_id),
+    n_app_ids_in_group = n_distinct(app_id),
+    all_app_ids_in_group = paste(sort(unique(app_id)), collapse = "; "),
+    any_news_cat_in_group = any(is_news_cat)
+  ) %>%
+  ungroup() %>%
+  select(app_id, app_n, app_cat, representative_app_id,
+         n_app_ids_in_group, all_app_ids_in_group, any_news_cat_in_group)
+
+cat("Rows in app_metadata_lookup (should equal app_ids after direction 1):",
+    nrow(app_metadata_lookup), "\n")
+cat("Confirms row count unchanged by direction-2 alignment:",
+    nrow(app_metadata_lookup) == nrow(app_metadata_by_id), "\n")
+cat("app_ids belonging to a group of 2+ that got aligned:",
+    sum(app_metadata_lookup$n_app_ids_in_group > 1), "\n")
+cat("Of those, aligned via the News, Media & Publications preference:",
+    sum(app_metadata_lookup$n_app_ids_in_group > 1 & app_metadata_lookup$any_news_cat_in_group), "\n")
+
+## Diagnostic log: one row per group, not per app_id, for a compact
+## audit of exactly which app_ids were aligned to which representative.
+app_id_alignment_log <- app_metadata_lookup %>%
+  filter(n_app_ids_in_group > 1) %>%
+  distinct(app_n, representative_app_id, any_news_cat_in_group,
+           n_app_ids_in_group, all_app_ids_in_group)
+
+cat("Distinct groups with multiple app_ids aligned:", nrow(app_id_alignment_log), "\n")
+print(app_id_alignment_log)
+
+save_both(app_metadata_lookup, "app_metadata_lookup")
+save_both(app_id_alignment_log, "app_id_alignment_log")
+```
+
+## Joining metadata onto app visits
+
+Unchanged join, `by = "app_id"`: since `app_metadata_lookup` still has
+exactly one row per original `app_id` (direction 2 only aligned values
+within rows, never removed rows), every `app_id` observed in
+`app_visits_raw` finds its match here, including the "other" app_id in
+an aligned group -- it now simply carries the same, aligned `app_n`/
+`app_cat` as its group's representative.
+
+```{r join-metadata-onto-visits}
+app_visits <- app_visits_raw %>%
+  left_join(app_metadata_lookup, by = "app_id")
+
+cat("App visits matched to app_n/app_cat:", sum(!is.na(app_visits$app_n)), "of", nrow(app_visits), "\n")
+cat("App visits with no metadata match:", sum(is.na(app_visits$app_n)), "\n")
+cat("Unique app_ids in app_visits:", n_distinct(app_visits$app_id), "\n")
+cat("Unique app names in app_visits (post-alignment):", n_distinct(app_visits$app_n), "\n")
+```
+
+## Saving
+
+```{r save-app-visits}
+glimpse(app_visits)
+save_both(app_visits, "app_visits")
+```
+
+# Part 2: Preparing the News-App-to-Domain Mapping Workbook
+
+Does not modify `app_visits` or any other visit-level data. Only output: an
+editable Excel workbook, filled in by hand afterwards. Depends on
+`mobile_views_raw` and `output_dir` from Part 1.
+
+## Why manual mapping
+
+| Issue | Consequence |
+|---|---|
+| App category (e.g. "News, Media & Publications") only signals "plausibly a news app" | Not which publisher domain, if any, is behind it |
+| Some apps in that category are genuine single-publisher news apps | e.g. a broadcaster's own app, clear domain mapping |
+| Others are readers, aggregators, browsers, platforms | No single editorial publisher; forcing a domain would misclassify them |
+| Decision | Export only the candidate apps observed in visit data; decide app by app, by hand |
+
+## Restricting to apps observed in visit data
+
+Data minimisation: build a mapping workbook only for apps actually seen in
+mobile visit data, not for every app that theoretically exists in the
+metadata export. `app_metadata_lookup` from Part 1 already has both
+inconsistency directions resolved, so no re-reading or re-cleaning of
+`app_metadata_raw` is needed here.
+
+```{r observed-app-ids}
+mobile_app_ids_observed <- app_visits_raw %>%
+  distinct(app_id)
+```
+
+## Identifying news-app candidates
+
+Restricted to the exact category `"News, Media & Publications"`, matched
+case-insensitively with `^`/`$` anchors so the whole field must match.
+This avoids picking up unrelated categories that merely contain the word
+"media." Built directly from `app_metadata_lookup`, which already has one
+row per `app_id`, with both inconsistency directions resolved -- so this
+candidate list is automatically consistent, without needing its own
+deduplication logic.
+
+```{r news-app-candidates}
+app_news_lookup_needs_domain_mapping <- app_metadata_lookup %>%
+  mutate(
+    is_news_app_candidate = str_detect(app_cat, news_category_regex)
+  ) %>%
+  semi_join(mobile_app_ids_observed, by = "app_id") %>%
+  filter(is_news_app_candidate) %>%
+  arrange(app_n, app_id) %>%
+  transmute(
+    app_id,
+    app_n,
+    app_cat,
+    is_news_app_candidate,
+    n_app_ids_in_group,
+    all_app_ids_in_group,
+
+    # Filled in manually in Excel, only for genuine editorial publisher
+    # apps. Bare registrable domain, e.g. "tagesschau.de", never a full
+    # URL, path, protocol prefix, or "www.". Rows sharing
+    # all_app_ids_in_group are the same app under different app_ids and
+    # should get the same domain.
+    domain = NA_character_,
+
+    # Coding convention:
+    # mapped: clear editorial publisher-domain mapping
+    # no_editorial_domain: reader, browser, aggregator, platform, etc.
+    # uncertain: needs additional review
+    mapping_status = "uncertain",
+
+    # Short justification, especially for uncertain or excluded apps.
+    mapping_note = NA_character_
+  )
+
+cat("Unique app IDs observed in mobile visits:", nrow(mobile_app_ids_observed), "\n")
+cat("Candidate news/media apps requiring manual domain mapping:",
+    nrow(app_news_lookup_needs_domain_mapping), "\n")
+cat("Of those, part of a multi-app_id group (already aligned in Part 1):",
+    sum(app_news_lookup_needs_domain_mapping$n_app_ids_in_group > 1), "\n")
+```
+
+## Exporting the editable Excel workbook
+
+Excel, not `.Rds`, on purpose. The whole point is filling in `domain`,
+`mapping_status`, `mapping_note` by hand before any of this re-enters the
+pipeline.
+
+```{r export-workbook}
+app_lookup_xlsx_path <- file.path(
+  output_dir,
+  "app_news_lookup_needs_domain_mapping.xlsx"
+)
+
+mapping_instructions <- tibble(
+  field = c(
+    "domain",
+    "mapping_status",
+    "mapping_note",
+    "n_app_ids_in_group / all_app_ids_in_group",
+    "General rule"
+  ),
+  instruction = c(
+    "Enter the publisher's bare registrable domain, for example tagesschau.de. Do not enter https://, www., URL paths, or query parameters.",
+    "Use mapped for a clear editorial publisher mapping; use no_editorial_domain for readers, browsers, aggregators, platforms, and non-journalistic apps; use uncertain when review is needed.",
+    "Briefly document the reason for uncertain or excluded apps, particularly for ambiguous cases.",
+    "If n_app_ids_in_group > 1, this app_id shares a name with other app_ids listed in all_app_ids_in_group (same app, different platform/store variant). All of them were already aligned to the same app_n/app_cat in app_metadata_lookup.",
+    "Only rows with mapping_status = mapped and a non-missing domain will later be used to create publisher-domain proxy visits."
+  )
+)
+
+openxlsx::write.xlsx(
+  x = list(
+    app_domain_mapping = app_news_lookup_needs_domain_mapping,
+    instructions = mapping_instructions
+  ),
+  file = app_lookup_xlsx_path,
+  overwrite = TRUE,
+  asTable = TRUE
+)
+
+message(
+  "Saved editable app-domain mapping workbook."
+)
+```
+
+This workbook is the input to a manual coding task, already finished, can
+be found under apps_websites_corrected.rds and
+apps_websites_corrected_with_pc1.xlsx; merging happens later in 01d, when
+`content_id` is remapped from app names to publisher domains.
+
+# Part 3: Top-N Apps by Traffic, Independent of App-Store Category
+
+Part 2 only ever considers apps already labelled `"News, Media &
+Publications"` by the app store. That label is Bilendi's category, not a
+ground truth, so an app like AOL -- which bundles mail, news, and weather
+and may well be filed under a different store category (e.g.
+"Productivity") -- could in principle never enter the mapping workbook,
+regardless of how much traffic it has.
+
+This section flips the logic: instead of starting from the category
+label, start from traffic. The `n_top_apps` most-visited apps overall are
+checked directly, regardless of `app_cat`, so a high-traffic app that was
+missed by the category filter still gets a chance at manual domain
+mapping. Since `app_visits` already has both metadata-inconsistency
+directions resolved (Part 1), this ranking is not distorted by the same
+app's traffic being split across multiple `app_id`s.
+
+## Ranking apps by total visits
+
+```{r topn-apps-by-traffic}
+n_top_apps <- 300
+
+app_visit_counts <- app_visits %>%
+  count(app_id, app_n, app_cat, name = "n_visits") %>%
+  arrange(desc(n_visits))
+
+top_apps_by_traffic <- app_visit_counts %>%
+  slice_head(n = n_top_apps)
+
+cat("Top", n_top_apps, "apps by traffic cover",
+    round(100 * sum(top_apps_by_traffic$n_visits) / sum(app_visit_counts$n_visits), 1),
+    "% of all app visits\n")
+```
+
+## Which of these already went through the category-based mapping step
+
+```{r topn-apps-already-covered}
+top_apps_by_traffic <- top_apps_by_traffic %>%
+  mutate(
+    already_in_category_candidates = app_id %in% app_news_lookup_needs_domain_mapping$app_id
+  )
+
+cat("Of the top", n_top_apps, "apps by traffic:\n")
+cat(" - already covered by the category-based candidate list:",
+    sum(top_apps_by_traffic$already_in_category_candidates), "\n")
+cat(" - missed by the category filter, needs a look:",
+    sum(!top_apps_by_traffic$already_in_category_candidates), "\n")
+
+top_apps_missed_by_category <- top_apps_by_traffic %>%
+  filter(!already_in_category_candidates) %>%
+  select(app_id, app_n, app_cat, n_visits)
+
+print(top_apps_missed_by_category)
+```
+
+## Conclusion
+
+Manual inspection of the top `r n_top_apps` apps by traffic (covering the
+percentage of total app visits printed above) confirmed that every
+plausible news-app candidate is already captured by the category-based
+mapping workbook from Part 2. No further manual additions to
+`app_news_lookup_needs_domain_mapping.xlsx` were necessary based on this
+check.

@@ -1,0 +1,1411 @@
+---
+title: "Hypothesis Tests: H1a to H4b"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+Estimates the models of Chapter 4 on the analysis dataset built by `03a`. No
+merging happens here; the dataset is read as-is.
+
+All models are estimated separately by wave. Each wave covers one policy topic
+and its own randomization, so there are no wave fixed effects and no
+clustering: each model contains at most one observation per participant.
+
+## Structure
+
+| Part | Content | Equation |
+|---|---|---|
+| 1--2 | Setup, data, coverage |  |
+| 2b | Covariate missingness and the covariate-complete subsample |  |
+| 3 | Benchmark ITT and first stage, on uptake and on effort | 4.11, 4.12 |
+| 4 | Encountered quality: three estimation samples, observability, scored cases by arm, Lee bounds | 4.13 |
+| 5 | H1b: effort and encountered quality | 4.14 |
+| 6 | H2: quality and attitude change, three estimation samples | 4.15 |
+| 7 | H3a: quality pathway by habitual-quality group | 4.16 |
+| 8 | H4a: treatment effect by habitual-quality group, split and continuous | 4.17 |
+| 9 | H4b: subgroup LATE, split, continuous, and reduced form | 4.18, 4.19 |
+| 10 | H3b: conditional indirect effects and sensitivity | 4.20--4.22 |
+| 11 | Sensitivity: weightings, category sets, need for cognition |  |
+| 12 | Knowledge outcome |  |
+| 13 | Detection limits: MDE and design analysis |  |
+| 14 | Hypothesis index |  |
+
+## Reading rules fixed in advance
+
+| Rule | Applies to |
+|---|---|
+| A subgroup difference requires the interaction term, not two separate significances | H3a, H4a, H4b |
+| Indirect effects are assumption-dependent and labelled as such | H3b |
+| A weak first stage makes a LATE uninformative, not null | H4b |
+| Where a 2SLS estimate and its reduced form disagree materially, the reduced form governs | H4b |
+| An estimate below the minimum detectable effect of its own model is read as imprecise, whether or not it reaches significance | all |
+| Wave 2 quality estimates rest on 22 to 24 participants and are read as imprecise | H1a, H1b, H2, H3a, H3b |
+
+## Outputs
+
+Tables are written as LaTeX fragments to `Output/03_analysis/tables/` and as
+CSV alongside.
+
+| File | Content |
+|---|---|
+| `tab_covariate_missingness` | Covariates with missing values, by wave |
+| `tab_itt_absolute`, `tab_itt_signed` | ITT on absolute and signed attitude change |
+| `tab_first_stage`, `tab_first_stage_effort` | First stage on uptake and on effort |
+| `tab_h1a_treatment_quality` | Encountered quality, three estimation samples |
+| `tab_h1a_observability` | Treatment effect on quality-score observability |
+| `tab_h1a_scored_by_arm` | Participants with a constructible quality score, by arm |
+| `tab_h1a_lee_bounds` | Trimming bounds on encountered quality |
+| `tab_h1b_effort_quality` | Effort and encountered quality |
+| `tab_h2_quality_attitude` | Quality and attitude change, three estimation samples |
+| `tab_h3a_quality_moderation` | Quality pathway by habitual-quality group |
+| `tab_h4a_treatment_moderation` | Treatment effect by habitual-quality group |
+| `tab_h4a_common_sample` | H4a on a sample common to all three diet definitions |
+| `tab_h4a_continuous` | H4a under a continuous moderator |
+| `tab_h4b_late_full`, `tab_h4b_late_interaction`, `tab_h4b_subgroups` | Uptake LATE, interaction, subgroups |
+| `tab_h4b_continuous` | H4b under a continuous moderator |
+| `tab_h3b_indirect_effects`, `tab_h3b_sensitivity` | Conditional indirect effects and sensitivity |
+| `tab_sens_weighting`, `tab_sens_category_set`, `tab_sens_nfc` | Sensitivity analyses |
+| `tab_knowledge_*` | Knowledge outcome: ITT, ANCOVA, quality, LATE, moderation |
+| `tab_detection_limits`, `tab_design_analysis` | MDE and design analysis |
+| `hypothesis_index.csv` | Hypothesis-to-table index |
+
+# Part 1: Setup
+
+```{r libraries, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(AER)
+library(broom)
+library(mediation)
+
+# AER and mediation load MASS, whose select() masks dplyr's.
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+
+```{r paths-config, echo=FALSE}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+input_dir  <- file.path(project_root, "Output", "03_analysis_data")
+table_dir  <- file.path(input_dir, "tables")
+dir.create(table_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+```{r config}
+WAVE_TOPICS <- c("1" = "Child support", "2" = "Energy transition", "3" = "Cannabis")
+
+# Short labels for tables; full names stay in the console output.
+TOPIC_SHORT <- c("Child support" = "T1", "Energy transition" = "T2", "Cannabis" = "T3")
+TOPIC_NOTE  <- "T1 = child support, T2 = renewable-energy transition, T3 = cannabis legalization."
+
+DIET_VARIANTS <- c("overall", "news", "news_corrected")
+DIET_SHORT    <- c("overall" = "All", "news" = "OIE-a", "news_corrected" = "OIE-c")
+DIET_NOTE <- "All = overall scored OIE; OIE-a = automatically classified OIE; OIE-c = manually coded OIE."
+
+# Covariate set, minus the wave-specific ones added per model where relevant.
+COVARS <- c("att_baseline", "prior_engagement", "polknow_total",
+            "pol_interest_general", "newsuse_online", "edu_time", "age", "gender_f")
+
+set.seed(20260912)
+N_BOOT <- 2000
+```
+
+
+Three helpers: fit a model and return a tidy row set, format numbers, and
+write a LaTeX fragment in the thesis table style.
+
+```{r helpers-estimation}
+# OLS or 2SLS depending on whether an instrument is supplied.
+fit_model <- function(data, y, rhs, instruments = NULL, keep = NULL) {
+  f <- if (is.null(instruments)) {
+    as.formula(paste(y, "~", paste(rhs, collapse = " + ")))
+  } else {
+    as.formula(paste(y, "~", paste(rhs, collapse = " + "), "|",
+                     paste(instruments, collapse = " + ")))
+  }
+  fit <- try(if (is.null(instruments)) lm(f, data = data) else ivreg(f, data = data),
+             silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+
+  out <- broom::tidy(fit, conf.int = TRUE, conf.level = 0.95) %>%
+    transmute(term, estimate, std.error, conf.low, conf.high, p.value) %>%
+    mutate(n = nobs(fit))
+
+  g <- tryCatch(broom::glance(fit), error = function(e) NULL)
+  out$r2     <- if (!is.null(g) && "r.squared" %in% names(g)) g$r.squared else NA_real_
+  out$adj_r2 <- if (!is.null(g) && "adj.r.squared" %in% names(g)) g$adj.r.squared else NA_real_
+
+  pick <- function(d, pattern, col, agg = function(x) x[1]) {
+    if (is.null(d) || !col %in% colnames(d)) return(NA_real_)
+    hit <- grep(pattern, rownames(d))
+    if (length(hit) == 0) return(NA_real_)
+    unname(agg(d[hit, col]))
+  }
+
+  if (!is.null(instruments)) {
+    d <- tryCatch(summary(fit, diagnostics = TRUE)$diagnostics,
+                  error = function(e) NULL)
+    out$first_stage_F <- pick(d, "^Weak instruments", "statistic", min)
+    out$wu_hausman_p  <- pick(d, "^Wu-Hausman", "p.value")
+    out$sargan_p      <- pick(d, "^Sargan", "p.value")
+  } else {
+    out$first_stage_F <- NA_real_
+    out$wu_hausman_p  <- NA_real_
+    out$sargan_p      <- NA_real_
+  }
+
+  if (!is.null(keep)) out <- out %>% filter(str_detect(term, keep))
+  out
+}
+
+# Run one specification across all three waves.
+across_waves <- function(dat, ...) {
+  imap_dfr(dat, function(d, nm) {
+    res <- fit_model(d, ...)
+    if (is.null(res)) return(NULL)
+    res %>% mutate(wave = as.integer(str_remove(nm, "wave")), .before = 1)
+  }) %>%
+    mutate(topic = WAVE_TOPICS[as.character(wave)], .after = wave)
+}
+
+stars <- function(p) case_when(is.na(p) ~ "", p < .001 ~ "***", p < .01 ~ "**",
+                               p < .05 ~ "*", p < .10 ~ "+", TRUE ~ "")
+```
+
+```{r helpers-latex}
+# Booktabs table in the style of a regression table: estimate with significance
+# markers, standard error in parentheses, confidence interval, exact p-value,
+# and sample size. Topic and variant labels are abbreviated, with the key in
+# the note.
+write_latex_table <- function(df, file, digits = 3, caption = NULL,
+                              label = NULL, note = NULL) {
+
+  esc  <- function(x) str_replace_all(as.character(x), "([_%&#$])", "\\\\\\1")
+  num  <- function(x, d = digits) ifelse(is.na(x), "--", formatC(x, format = "f", digits = d))
+  # Integer-valued columns are printed without decimals.
+  is_int <- function(x) is.numeric(x) && all(is.na(x) | abs(x - round(x)) < 1e-9)
+  pfmt <- function(p) ifelse(is.na(p), "--",
+                      ifelse(p < .001, "$<$.001",
+                             sub("^0", "", formatC(p, format = "f", digits = 3))))
+
+  d <- df
+
+  if ("Topic" %in% names(d)) {
+    d$Topic <- dplyr::coalesce(TOPIC_SHORT[as.character(d$Topic)], as.character(d$Topic))
+    d$Topic <- factor(d$Topic, levels = c("T1", "T2", "T3"))
+    d <- d %>% arrange(Topic, .by_group = FALSE)
+    d$Topic <- as.character(d$Topic)
+  }
+  if ("Variant" %in% names(d)) {
+    d$Variant <- dplyr::coalesce(DIET_SHORT[as.character(d$Variant)], as.character(d$Variant))
+  }
+  if ("Category set" %in% names(d)) {
+    lab <- c(primary = "Primary", news_only = "News only", incl_search = "Incl. search")
+    d[["Category set"]] <- dplyr::coalesce(lab[as.character(d[["Category set"]])],
+                                           as.character(d[["Category set"]]))
+  }
+
+  # Significance markers merged into the estimate column, then dropped.
+  est_col <- intersect(c("Estimate", "Split", "Continuous (per SD)",
+                         "Reduced form", "Naive diff"), names(d))
+  if (length(est_col) && "Sig" %in% names(d)) {
+    s <- ifelse(d$Sig == "" | is.na(d$Sig), "", paste0("$^{", d$Sig, "}$"))
+    d[[est_col[1]]] <- paste0(num(d[[est_col[1]]]), s)
+    d$Sig <- NULL
+  }
+
+  # Confidence bounds collapsed into one bracketed column.
+  ci <- intersect(c("CI low", "CI_low", "conf.low"), names(d))
+  ch <- intersect(c("CI high", "CI_high", "conf.high"), names(d))
+  if (length(ci) && length(ch)) {
+    d[["95% CI"]] <- paste0("[", num(d[[ci]]), ", ", num(d[[ch]]), "]")
+    d[[ci]] <- NULL; d[[ch]] <- NULL
+    d <- d %>% relocate(`95% CI`, .after = any_of(c("SE", est_col, "Estimate")))
+  }
+
+  if ("SE" %in% names(d)) d$SE <- ifelse(is.na(d$SE), "--", paste0("(", num(d$SE), ")"))
+  if ("p"  %in% names(d)) d$p  <- pfmt(d$p)
+
+  body <- d %>%
+    mutate(across(where(is_int), ~ num(.x, 0))) %>%
+    mutate(across(where(is.numeric), ~ num(.x))) %>%
+    mutate(across(everything(), ~ {
+      x <- as.character(.x)
+      x <- ifelse(is.na(x) | x == "NA", "--", x)
+      # Leave cells that already contain maths or brackets untouched.
+      ifelse(str_detect(x, "\\$|\\[|\\("), x, esc(x))
+    }))
+
+  hdr <- names(d)
+  hdr <- ifelse(hdr == "adj. R2", "adj. $R^2$", esc(hdr))
+
+  rows <- apply(body, 1, function(r) paste0("  ", paste(r, collapse = " & "), " \\\\"))
+
+  notes <- c(TOPIC_NOTE,
+             if ("Variant" %in% names(df)) DIET_NOTE,
+             note,
+             "$^{+}p<.10$, $^{*}p<.05$, $^{**}p<.01$, $^{***}p<.001$.")
+  notes <- paste(notes[!is.na(notes)], collapse = " ")
+
+  lines <- c(
+    "\\begin{table}[htbp]",
+    "\\centering",
+    "\\begin{threeparttable}",
+    if (!is.null(caption)) paste0("\\caption{", caption, "}"),
+    paste0("\\label{tab:", if (is.null(label)) file else label, "}"),
+    paste0("\\begin{tabular}{l", paste(rep("c", ncol(d) - 1), collapse = ""), "}"),
+    "\\toprule",
+    paste0("  ", paste(hdr, collapse = " & "), " \\\\"),
+    "\\midrule",
+    rows,
+    "\\bottomrule",
+    "\\end{tabular}",
+    paste0("\\begin{tablenotes}\\footnotesize\\item \\textit{Note.} ", notes, "\\end{tablenotes}"),
+    "\\end{threeparttable}",
+    "\\end{table}"
+  )
+
+  writeLines(lines[!is.na(lines)], file.path(table_dir, paste0(file, ".tex")))
+  write_csv(df, file.path(table_dir, paste0(file, ".csv")))
+  invisible(df)
+}
+
+
+# Standard presentation: one row per wave, estimate with stars, SE, CI, p, N,
+# and the model fit where it is defined.
+present <- function(res, term_filter, label_col = "Topic", fit = TRUE, digits = 3) {
+  out <- res %>%
+    filter(str_detect(term, term_filter)) %>%
+    transmute(Topic = topic,
+              Estimate = round(estimate, digits),
+              SE = round(std.error, digits),
+              `CI low` = round(conf.low, digits),
+              `CI high` = round(conf.high, digits),
+              p = round(p.value, 3),
+              Sig = stars(p.value),
+              N = n,
+              `adj. R2` = round(adj_r2, 3))
+  if (!fit || all(is.na(out[["adj. R2"]]))) out[["adj. R2"]] <- NULL
+  out
+}
+```
+
+# Part 2: Data
+
+```{r load-data}
+analysis_data <- readRDS(file.path(input_dir, "analysis_data_by_wave.Rds"))
+
+stopifnot(length(analysis_data) == 3)
+imap(analysis_data, ~ cat(.y, ":", nrow(.x), "rows\n")) %>% invisible()
+
+# Coverage of the variables that limit the quality models.
+map_dfr(analysis_data, ~ tibble(n = nrow(.x),
+                                q_primary = sum(!is.na(.x$q_primary)),
+                                uptake = sum(!is.na(.x$exp_topic_uptake_yn))),
+        .id = "wave") %>%
+  as.data.frame() %>% print()
+```
+## Part 2b: Estimation Samples
+```{r estimation-samples}
+
+
+# Two conditions restrict a model's sample and are kept apart here:
+# covariate missingness (prior_engagement, from the survey) and exposure
+# coverage (q_primary, from the tracking data).
+
+covar_missing <- map_dfr(analysis_data, function(d) {
+  summarise(d, across(all_of(COVARS), ~ sum(is.na(.x))))
+}, .id = "wave") %>%
+  pivot_longer(-wave, names_to = "Covariate", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  pivot_wider(names_from = wave, values_from = n_missing, values_fill = 0L) %>%
+  rename_with(~ unname(TOPIC_SHORT[WAVE_TOPICS[str_remove(.x, "wave")]]),
+              starts_with("wave"))
+
+cat("Covariates with missing values (blank means complete):\n")
+print(as.data.frame(covar_missing))
+
+# The covariate-complete subsample. lm() drops incomplete rows, so adjusted
+# models are fitted on it in any case.
+cc_data <- map(analysis_data, ~ filter(.x, if_all(all_of(COVARS), ~ !is.na(.x))))
+
+map_dfr(list(full = analysis_data, complete = cc_data),
+        ~ map_dfr(.x, ~ tibble(n = nrow(.x)), .id = "wave"),
+        .id = "sample") %>%
+  pivot_wider(names_from = sample, values_from = n) %>%
+  mutate(lost = full - complete) %>%
+  as.data.frame() %>% print()
+
+write_latex_table(covar_missing, "tab_covariate_missingness",
+                  caption = "Covariate missingness by wave")
+```
+
+# Part 3: Benchmark Effects and First Stage (Eq. 4.11, 4.12)
+
+Not a hypothesis of this thesis. These models establish comparability with
+the original study and supply the treatment and first-stage quantities the
+IV models in Part 9 require.
+
+```{r benchmark-itt}
+itt_abs <- across_waves(analysis_data, y = "y_abs",
+                        rhs = c("t_verbal", "t_money"))
+itt_signed <- across_waves(analysis_data, y = "y_signed",
+                           rhs = c("t_verbal", "t_money"))
+
+cat("ITT on absolute attitude change:\n")
+tab_itt_abs <- bind_rows(
+  present(itt_abs, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(itt_abs, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_itt_abs))
+write_latex_table(tab_itt_abs, "tab_itt_absolute", caption = "ITT, absolute change")
+
+cat("\nITT on signed attitude change:\n")
+tab_itt_signed <- bind_rows(
+  present(itt_signed, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(itt_signed, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_itt_signed))
+write_latex_table(tab_itt_signed, "tab_itt_signed", caption = "ITT, signed change")
+```
+
+```{r benchmark-first-stage}
+fs <- across_waves(analysis_data, y = "exp_topic_uptake_yn",
+                   rhs = c("t_verbal", "t_money"))
+
+cat("Behavioural first stage (Eq. 4.3):\n")
+tab_fs <- bind_rows(
+  present(fs, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(fs, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_fs))
+write_latex_table(tab_fs, "tab_first_stage", caption = "First stage on uptake")
+```
+```{r first-stage-effort}
+# First stage on effort rather than on uptake.
+fs_effort <- across_waves(analysis_data, y = "effort_count",
+                          rhs = c("t_verbal", "t_money"))
+
+cat("First stage on effort (count of topic-relevant visits):\n")
+tab_fs_effort <- bind_rows(
+  present(fs_effort, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(fs_effort, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_fs_effort))
+write_latex_table(tab_fs_effort, "tab_first_stage_effort",
+                  caption = "First stage on effort")
+
+# Distribution of effort by arm, alongside the mean reported above.
+cat("\nEffort distribution by arm:\n")
+dat_all <- bind_rows(analysis_data)
+dat_all %>%
+  group_by(Topic = WAVE_TOPICS[as.character(wave)], Arm = group_f) %>%
+  summarise(n = n(),
+            pct_any = round(100 * mean(effort_count > 0), 1),
+            median_if_any = median(effort_count[effort_count > 0]),
+            mean = round(mean(effort_count), 2),
+            max = max(effort_count),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+# Part 4: Realization and the Level of Encountered OIEQ (Eq. 4.13)
+
+> **H1a:** Randomized encouragement increases the probability that a
+> participant realizes a topic-relevant online information environment whose
+> quality can be characterized.
+
+Realization is the binary outcome `realized`: at least one topic-relevant
+visit to a domain carrying a quality score. It is defined for every
+participant-wave, so H1a is estimated on the full wave sample.
+
+The level of encountered quality is estimated afterwards. That outcome exists
+only where `realized == 1`, so its sample is defined by a post-treatment
+variable; the arm composition and the trimming bounds below quantify what
+follows from that.
+
+```{r h1a-realization}
+realized <- across_waves(
+  map(analysis_data, ~ mutate(.x, realized = as.integer(!is.na(q_primary)))),
+  y = "realized", rhs = c("t_verbal", "t_money"))
+
+cat("H1a: encouragement and realization of a characterizable environment\n")
+tab_h1a_real <- bind_rows(
+  present(realized, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(realized, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_h1a_real))
+
+write_latex_table(tab_h1a_real, "tab_h1a_realization",
+                  caption = "H1a: encouragement and realization of a characterizable environment")
+```
+
+Realization requires topic-relevant activity and rating coverage, so the
+effect is bounded above by the first stage on uptake reported in Part 3.
+
+```{r h1a-realization-vs-uptake}
+# Realization against uptake, same arms and samples. The gap is the share of
+# topic-relevant activity that reached no rated domain.
+bind_rows(
+  present(fs, "^t_money")       %>% mutate(Outcome = "Uptake", .after = Topic),
+  present(realized, "^t_money") %>% mutate(Outcome = "Realization", .after = Topic)
+) %>% arrange(Topic, Outcome) %>% as.data.frame() %>% print()
+```
+
+## Level of encountered OIEQ
+
+```{r qlevel-three-samples}
+# Three columns: 1 to 2 is the change of sample, 2 to 3 the adjustment.
+qlevel     <- across_waves(analysis_data, y = "q_primary",
+                           rhs = c("t_verbal", "t_money"))
+qlevel_cc  <- across_waves(cc_data, y = "q_primary",
+                           rhs = c("t_verbal", "t_money"))
+qlevel_adj <- across_waves(cc_data, y = "q_primary",
+                           rhs = c("t_verbal", "t_money", COVARS))
+
+tab_qlevel <- bind_rows(
+  present(qlevel,     "^t_money") %>% mutate(Model = "1 Unadjusted, full", .after = Topic),
+  present(qlevel_cc,  "^t_money") %>% mutate(Model = "2 Unadjusted, cc",   .after = Topic),
+  present(qlevel_adj, "^t_money") %>% mutate(Model = "3 Adjusted",         .after = Topic)
+) %>% arrange(Topic, Model)
+
+# Columns 2 and 3 must rest on the same rows.
+stopifnot(tab_qlevel %>% filter(Model != "1 Unadjusted, full") %>%
+            group_by(Topic) %>% summarise(k = n_distinct(N), .groups = "drop") %>%
+            pull(k) %>% (\(x) all(x == 1)))
+
+cat("Level of encountered OIEQ, three estimation samples\n")
+print(as.data.frame(tab_qlevel))
+
+write_latex_table(tab_qlevel, "tab_q_level",
+                  caption = "Level of encountered OIEQ, three estimation samples")
+```
+
+```{r qlevel-scored-by-arm}
+# Arm composition of the participants who carry a quality score.
+tab_scored_by_arm <- map_dfr(analysis_data, ~ .x %>%
+          group_by(Arm = group_f) %>%
+          summarise(N          = n(),
+                    `n scored` = sum(!is.na(q_primary)),
+                    `% scored` = round(100 * mean(!is.na(q_primary)), 1),
+                    .groups    = "drop"),
+        .id = "wave") %>%
+  mutate(Topic = WAVE_TOPICS[str_remove(wave, "wave")], .before = 1) %>%
+  select(-wave)
+
+cat("Participants with a quality score, by arm:\n")
+print(as.data.frame(tab_scored_by_arm))
+
+write_latex_table(tab_scored_by_arm, "tab_q_level_scored_by_arm", digits = 1,
+                  caption = "Participants with a constructible quality score, by arm")
+```
+
+```{r qlevel-lee-bounds}
+# Trimming bounds under monotonicity (Lee, 2009), monetary versus control.
+# The trim share is the excess selection rate of the treated arm; the bounds
+# trim that share from the top and from the bottom of the treated outcome
+# distribution.
+
+lee_bounds <- function(d, outcome = "q_primary", treat = "t_money") {
+  d <- d %>% filter(group_f != "verbal")
+  y  <- d[[outcome]]
+  tr <- d[[treat]] == 1
+  s  <- !is.na(y)
+
+  p1 <- mean(s[tr])
+  p0 <- mean(s[!tr])
+  if (p1 <= p0) return(NULL)          # monotonicity runs the other way here
+
+  q   <- (p1 - p0) / p1               # excess share to be trimmed
+  y1  <- sort(y[tr & s])
+  y0  <- mean(y[!tr & s])
+  k   <- floor(length(y1) * q)
+
+  c(trim_share = q,
+    lower = mean(head(y1, length(y1) - k)) - y0,   # drop the top q
+    upper = mean(tail(y1, length(y1) - k)) - y0,   # drop the bottom q
+    naive = mean(y1) - y0,
+    n_treated_selected = length(y1))
+}
+
+set.seed(20260913)
+tab_lee <- imap_dfr(analysis_data, function(d, nm) {
+  point <- lee_bounds(d)
+  if (is.null(point)) return(NULL)
+
+  boot <- replicate(N_BOOT, {
+    r <- lee_bounds(d[sample(nrow(d), replace = TRUE), ])
+    if (is.null(r)) c(NA_real_, NA_real_) else r[c("lower", "upper")]
+  })
+
+  # Bound low/high are the trimming bounds themselves; Boot. low/high are the
+  # bootstrap limits around them. They are kept apart so that the table does
+  # not merge two different intervals into one column.
+  tibble(Topic = WAVE_TOPICS[str_remove(nm, "wave")],
+         `Trim share`   = round(point["trim_share"], 3),
+         `Naive diff`   = round(point["naive"], 3),
+         `Bound low`    = round(point["lower"], 3),
+         `Bound high`   = round(point["upper"], 3),
+         `Boot. low`    = round(quantile(boot[1, ], .025, na.rm = TRUE), 3),
+         `Boot. high`   = round(quantile(boot[2, ], .975, na.rm = TRUE), 3),
+         N              = point["n_treated_selected"])
+})
+
+tab_lee <- tab_lee %>%
+  mutate(`N trimmed` = floor(N * (1 - `Trim share`)), .after = N)
+
+cat("Level of encountered OIEQ under trimming bounds, monetary versus control:\n")
+print(as.data.frame(tab_lee))
+
+write_latex_table(tab_lee, "tab_q_level_lee_bounds",
+                  caption = "Trimming bounds on the level of encountered OIEQ")
+
+# Monotonicity requires the treated selection rate to be the larger one.
+cat("\nSelection rates by arm (monotonicity requires monetary >= control):\n")
+map_dfr(analysis_data, ~ .x %>%
+          filter(group_f != "verbal") %>%
+          group_by(Arm = group_f) %>%
+          summarise(selected = round(mean(!is.na(q_primary)), 3), .groups = "drop"),
+        .id = "wave") %>%
+  pivot_wider(names_from = Arm, values_from = selected) %>%
+  as.data.frame() %>% print()
+```
+
+# Part 5: H1b -- Effort and Encountered Quality (Eq. 4.14)
+
+> **H1b:** Greater topic-relevant information-seeking effort is associated
+> with higher encountered information quality.
+
+Effort is not randomised, so the coefficient is an adjusted association.
+The primary effort measure is the count of topic-relevant visits;
+duration and distinct domains are supplementary.
+
+```{r h1b}
+h1b <- list(
+  count    = "effort_count",
+  duration = "topic_duration",
+  domains  = "n_topic_domains"
+) %>%
+  imap_dfr(function(v, nm) {
+    across_waves(analysis_data, y = "q_primary", rhs = c(v, COVARS)) %>%
+      filter(term == v) %>%
+      mutate(Measure = nm)
+  })
+
+tab_h1b <- present(h1b, ".", digits = 5) %>%
+  mutate(Measure = h1b$Measure, .after = Topic) %>%
+  arrange(Topic, Measure)
+
+cat("H1b: effort and encountered quality\n")
+print(as.data.frame(tab_h1b))
+write_latex_table(tab_h1b, "tab_h1b_effort_quality", digits = 5,
+                  caption = "H1b: effort and encountered quality")
+```
+
+# Part 6: H2 -- Quality and Attitude Change (Eq. 4.15)
+
+> **H2:** Higher information quality encountered during the experimental
+> period is associated with a greater magnitude of policy-attitude change.
+
+Treatment assignment is included so that the coefficient is a conditional
+association rather than a re-expression of the total treatment contrast.
+Quality is not randomised; this is evidence about a pathway, not an
+identified causal effect of quality.
+
+```{r h2}
+h2     <- across_waves(analysis_data, y = "y_abs",
+                       rhs = c("q_primary", "t_verbal", "t_money"))
+h2_cc  <- across_waves(cc_data, y = "y_abs",
+                       rhs = c("q_primary", "t_verbal", "t_money"))
+h2_adj <- across_waves(cc_data, y = "y_abs",
+                       rhs = c("q_primary", "t_verbal", "t_money", COVARS))
+
+tab_h2 <- bind_rows(
+  present(h2,     "^q_primary") %>% mutate(Model = "1 Unadjusted, full", .after = Topic),
+  present(h2_cc,  "^q_primary") %>% mutate(Model = "2 Unadjusted, cc",   .after = Topic),
+  present(h2_adj, "^q_primary") %>% mutate(Model = "3 Adjusted",         .after = Topic)
+) %>% arrange(Topic, Model)
+
+stopifnot(tab_h2 %>% filter(Model != "1 Unadjusted, full") %>%
+            group_by(Topic) %>% summarise(k = n_distinct(N), .groups = "drop") %>%
+            pull(k) %>% (\(x) all(x == 1)))
+
+cat("H2: encountered quality and attitude change\n")
+print(as.data.frame(tab_h2))
+
+write_latex_table(tab_h2, "tab_h2_quality_attitude",
+                  caption = "H2: quality and attitude change")
+```
+No bounds are computed for H2. Lee bounds identify a treatment contrast on a selected outcome; H2 is an association between two quantities that both exist only for selected participants, and the trimming logic has no treatment contrast to apply. The selection is instead reported directly:among control participants the quality measure exists for 1.0 to 2.9 percent, so H2 describes a relationship within the encouraged.
+
+# Part 7: H3a -- Habitual Quality Moderates the Quality Pathway (Eq. 4.16)
+
+> **H3a:** The positive association between experimental-period quality and
+> the magnitude of attitude change is stronger among participants with low
+> habitual OIEQ.
+
+With the low group as reference, its slope is `b1` and the high group's is
+`b1 + b3`. H3a predicts `b1 > 0` and `b3 < 0`. The interaction carries the
+inferential weight; subgroup estimates are reported for readability only.
+
+```{r h3a}
+h3a <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  across_waves(analysis_data, y = "y_abs",
+               rhs = c(paste0("q_primary * ", g), "t_verbal", "t_money", COVARS)) %>%
+    filter(str_detect(term, "^q_primary")) %>%
+    mutate(Variant = v,
+           Term = if_else(str_detect(term, ":"), "Interaction (b3)", "Low group (b1)"))
+})
+
+tab_h3a <- present(h3a, ".") %>%
+  mutate(Variant = h3a$Variant, Term = h3a$Term, .after = Topic) %>%
+  arrange(Topic, Variant, desc(Term))
+
+cat("H3a: quality x habitual-quality interaction\n")
+print(as.data.frame(tab_h3a))
+write_latex_table(tab_h3a, "tab_h3a_quality_moderation",
+                  caption = "H3a: quality-attitude link by habitual quality")
+```
+
+```{r h3a-subgroups}
+# Subgroup estimates, read together with the interaction term above.
+h3a_sub <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  map_dfr(c("low", "high"), function(grp) {
+    sub <- map(analysis_data, ~ filter(.x, .data[[g]] == grp))
+    across_waves(sub, y = "y_abs",
+                 rhs = c("q_primary", "t_verbal", "t_money", COVARS)) %>%
+      filter(term == "q_primary") %>%
+      mutate(Variant = v, Group = grp)
+  })
+})
+
+tab_h3a_sub <- present(h3a_sub, "^q_primary$") %>%
+  mutate(Variant = h3a_sub$Variant, Group = h3a_sub$Group, .after = Topic) %>%
+  arrange(Topic, Variant, desc(Group))
+
+print(as.data.frame(tab_h3a_sub))
+write_latex_table(tab_h3a_sub, "tab_h3a_subgroups",
+                  caption = "H3a: subgroup estimates (read with the interaction)")
+```
+
+# Part 8: H4a -- Habitual Quality Moderates the Treatment Effect (Eq. 4.17)
+
+> **H4a:** The effect of randomized encouragement on the magnitude of
+> attitude change is stronger among participants with low habitual OIEQ.
+
+Unlike H3a this uses a randomised regressor, so the subgroup contrast does
+not rest on an assumption about quality selection. The moderator is
+pre-treatment, so the interaction is well defined.
+
+```{r h4a}
+h4a <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  across_waves(analysis_data, y = "y_abs",
+               rhs = c("t_verbal", "t_money", g,
+                       paste0("t_verbal:", g), paste0("t_money:", g),
+                       COVARS)) %>%
+    filter(str_detect(term, "^t_verbal|^t_money")) %>%
+    mutate(Variant = v,
+           Arm = if_else(str_detect(term, "verbal"), "Verbal", "Monetary"),
+           Term = if_else(str_detect(term, ":"), "Interaction", "Low group"))
+})
+
+tab_h4a <- present(h4a, ".") %>%
+  mutate(Variant = h4a$Variant, Arm = h4a$Arm, Term = h4a$Term, .after = Topic) %>%
+  arrange(Topic, Variant, Arm, desc(Term))
+
+cat("H4a: treatment x habitual-quality interaction\n")
+print(as.data.frame(tab_h4a))
+write_latex_table(tab_h4a, "tab_h4a_treatment_moderation",
+                  caption = "H4a: treatment effect by habitual quality")
+```
+
+
+```{r h4a-common-sample}
+# The three diet definitions do not cover the same participants, so a contrast
+# between them confounds the definition with the composition of the sample.
+# This block holds the sample fixed at the rows for which all three exist.
+HAB_GROUPS <- paste0("hab_", DIET_VARIANTS, "_level_group")
+
+common_data <- map(cc_data, ~ filter(.x, if_all(all_of(HAB_GROUPS), ~ !is.na(.x))))
+
+h4a_common <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  across_waves(common_data, y = "y_abs",
+               rhs = c("t_verbal", "t_money", g,
+                       paste0("t_verbal:", g), paste0("t_money:", g),
+                       COVARS)) %>%
+    filter(str_detect(term, "^t_money:")) %>%
+    mutate(Variant = v)
+})
+
+# Within a wave the common sample is identical across definitions, so any
+# remaining difference is the definition alone.
+stopifnot(h4a_common %>% group_by(topic) %>%
+            summarise(k = n_distinct(n), .groups = "drop") %>%
+            pull(k) %>% (\(x) all(x == 1)))
+
+tab_h4a_common <- h4a %>%
+  filter(Term == "Interaction", Arm == "Monetary") %>%
+  transmute(Topic = topic, Variant,
+            `Own sample` = round(estimate, 3), `p (own)` = round(p.value, 3),
+            `N (own)` = n) %>%
+  left_join(h4a_common %>%
+              transmute(Topic = topic, Variant,
+                        `Common sample` = round(estimate, 3),
+                        `p (common)` = round(p.value, 3), `N (common)` = n),
+            by = c("Topic", "Variant")) %>%
+  arrange(Topic, Variant)
+
+cat("H4a monetary interaction: own versus common estimation sample\n")
+print(as.data.frame(tab_h4a_common))
+
+write_latex_table(tab_h4a_common, "tab_h4a_common_sample",
+                  caption = "H4a interaction on a sample common to all three diet definitions")
+```
+
+
+
+```{r h4a-continuous}
+# Same interaction with the continuous moderator in place of the split,
+# standardized within wave. The coefficient is the change in the treatment
+# effect per SD of habitual quality.
+
+h4a_cont <- map_dfr(DIET_VARIANTS, function(v) {
+  z <- paste0("hab_", v, "_dw_pc1")
+  sub <- map(cc_data, ~ mutate(.x, hab_z = as.numeric(scale(.data[[z]]))))
+  across_waves(sub, y = "y_abs",
+               rhs = c("t_verbal", "t_money", "hab_z",
+                       "t_verbal:hab_z", "t_money:hab_z", COVARS)) %>%
+    filter(str_detect(term, "^t_money")) %>%
+    mutate(Variant = v,
+           Term = if_else(str_detect(term, ":"), "Interaction", "Main effect"))
+})
+
+tab_h4a_cont <- h4a %>%
+  filter(Term == "Interaction", Arm == "Monetary") %>%
+  transmute(Topic = topic, Variant,
+            `Split` = round(estimate, 3), `p (split)` = round(p.value, 3),
+            `N (split)` = n) %>%
+  left_join(h4a_cont %>%
+              filter(Term == "Interaction") %>%
+              transmute(Topic = topic, Variant,
+                        `Continuous (per SD)` = round(estimate, 3),
+                        `p (cont.)` = round(p.value, 3), `N (cont.)` = n),
+            by = c("Topic", "Variant")) %>%
+  arrange(Topic, Variant)
+
+cat("H4a monetary interaction: median split versus continuous moderator\n")
+print(as.data.frame(tab_h4a_cont))
+
+write_latex_table(tab_h4a_cont, "tab_h4a_continuous",
+                  caption = "H4a interaction under a continuous habitual-quality moderator")
+```
+```{r h4a-sign-test}
+# Sign test across all interaction cells.
+h4a %>%
+  filter(Term == "Interaction") %>%
+  summarise(n = n(), n_negative = sum(estimate < 0),
+            p = binom.test(sum(estimate < 0), n())$p.value) %>%
+  as.data.frame() %>% print()
+```
+
+# Part 9: H4b -- Subgroup LATE of Uptake (Eq. 4.18, 4.19)
+
+> **H4b:** The effect of treatment-induced information seeking on attitude
+> change is stronger in the low habitual-quality subgroup.
+
+Uptake is instrumented with encouragement. A subgroup LATE refers to that
+subgroup's compliers, so the two are not automatically comparable; the
+interaction model is reported first for that reason.
+
+```{r h4b-full-sample}
+late <- across_waves(analysis_data, y = "y_abs",
+                     rhs = c("exp_topic_uptake_yn", COVARS),
+                     instruments = c("t_verbal", "t_money", COVARS))
+
+tab_late <- late %>%
+  filter(term == "exp_topic_uptake_yn") %>%
+  transmute(Topic = topic, Estimate = round(estimate, 3), SE = round(std.error, 3),
+            p = round(p.value, 3), Sig = stars(p.value), N = n,
+            `First-stage F` = round(first_stage_F, 2))
+
+cat("Uptake LATE, full sample:\n")
+print(as.data.frame(tab_late))
+write_latex_table(tab_late, "tab_h4b_late_full", caption = "Uptake LATE, full sample")
+```
+
+```{r h4b-interaction}
+# The instrument is interacted too, so the interaction term is itself
+# instrumented rather than only the main effect.
+h4b_int <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  across_waves(analysis_data, y = "y_abs",
+               rhs = c(paste0("exp_topic_uptake_yn * ", g), COVARS),
+               instruments = c(paste0("t_verbal * ", g), paste0("t_money * ", g), COVARS)) %>%
+    filter(str_detect(term, "^exp_topic_uptake_yn")) %>%
+    mutate(Variant = v,
+           Term = if_else(str_detect(term, ":"), "Interaction", "Low group"))
+})
+
+tab_h4b_int <- present(h4b_int, ".", fit = FALSE) %>%
+  mutate(Variant = h4b_int$Variant, Term = h4b_int$Term, .after = Topic) %>%
+  mutate(`First-stage F` = round(h4b_int$first_stage_F, 2)) %>%
+  arrange(Topic, Variant, desc(Term))
+
+cat("H4b: uptake LATE x habitual-quality interaction\n")
+print(as.data.frame(tab_h4b_int))
+write_latex_table(tab_h4b_int, "tab_h4b_late_interaction",
+                  caption = "H4b: uptake LATE by habitual quality")
+```
+
+```{r h4b-subgroups}
+h4b_sub <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  map_dfr(c("low", "high"), function(grp) {
+    sub <- map(analysis_data, ~ filter(.x, .data[[g]] == grp))
+    # A subgroup split can leave an instrument without variation.
+    ok <- map_lgl(sub, ~ n_distinct(.x$t_money, na.rm = TRUE) > 1 &&
+                        n_distinct(.x$exp_topic_uptake_yn, na.rm = TRUE) > 1)
+    if (!all(ok)) cat("  skipped (degenerate instrument):", v, grp,
+                      names(sub)[!ok], "\n")
+    across_waves(sub[ok], y = "y_abs",
+                 rhs = c("exp_topic_uptake_yn", COVARS),
+                 instruments = c("t_verbal", "t_money", COVARS)) %>%
+      filter(term == "exp_topic_uptake_yn") %>%
+      mutate(Variant = v, Group = grp)
+  })
+})
+
+tab_h4b_sub <- present(h4b_sub, "^exp_topic_uptake_yn$", fit = FALSE) %>%
+  mutate(Variant = h4b_sub$Variant, Group = h4b_sub$Group, .after = Topic) %>%
+  mutate(`First-stage F` = round(h4b_sub$first_stage_F, 2)) %>%
+  arrange(Topic, Variant, desc(Group))
+
+print(as.data.frame(tab_h4b_sub))
+write_latex_table(tab_h4b_sub, "tab_h4b_subgroups",
+                  caption = "H4b: subgroup LATEs (read with the interaction)")
+```
+```{r h4b-continuous}
+# Continuous moderator on the LATE. The moderator enters as a control, inside
+# the endogenous interaction, and in the instrument set, so that both
+# endogenous terms are instrumented.
+
+h4b_cont <- map_dfr(DIET_VARIANTS, function(v) {
+  z   <- paste0("hab_", v, "_dw_pc1")
+  sub <- map(cc_data, ~ mutate(.x, hab_z = as.numeric(scale(.data[[z]]))))
+  across_waves(sub, y = "y_abs",
+               rhs = c("exp_topic_uptake_yn", "exp_topic_uptake_yn:hab_z",
+                       "hab_z", COVARS),
+               instruments = c("t_verbal", "t_money", "hab_z",
+                               "t_verbal:hab_z", "t_money:hab_z", COVARS)) %>%
+    filter(str_detect(term, "^exp_topic_uptake_yn")) %>%
+    mutate(Variant = v,
+           Term = if_else(str_detect(term, ":"), "Interaction", "Main effect"))
+})
+
+tab_h4b_cont <- h4b_int %>%
+  filter(Term == "Interaction") %>%
+  transmute(Topic = topic, Variant,
+            Split = round(estimate, 3), `p (split)` = round(p.value, 3),
+            `F (split)` = round(first_stage_F, 2), `N (split)` = n) %>%
+  left_join(h4b_cont %>%
+              filter(Term == "Interaction") %>%
+              transmute(Topic = topic, Variant,
+                        `Continuous (per SD)` = round(estimate, 3),
+                        `p (cont.)` = round(p.value, 3),
+                        `F (cont.)` = round(first_stage_F, 2), `N (cont.)` = n),
+            by = c("Topic", "Variant")) %>%
+  arrange(Topic, Variant)
+
+cat("H4b LATE interaction: median split versus continuous moderator\n")
+print(as.data.frame(tab_h4b_cont))
+
+write_latex_table(tab_h4b_cont, "tab_h4b_continuous",
+                  caption = "H4b LATE interaction under a continuous habitual-quality moderator")
+```
+```{r h4b-reduced-form}
+# Reduced form of the same interaction: the outcome on the instruments,
+# without a first stage. Compared against the 2SLS estimates above.
+map_dfr(DIET_VARIANTS, function(v) {
+  z   <- paste0("hab_", v, "_dw_pc1")
+  sub <- map(cc_data, ~ mutate(.x, hab_z = as.numeric(scale(.data[[z]]))))
+  across_waves(sub, y = "y_abs",
+               rhs = c("t_verbal", "t_money", "hab_z",
+                       "t_verbal:hab_z", "t_money:hab_z", COVARS)) %>%
+    filter(term == "t_money:hab_z") %>%
+    mutate(Variant = v)
+}) %>%
+  transmute(Topic = topic, Variant,
+            `Reduced form` = round(estimate, 3), p_rf = round(p.value, 3)) %>%
+  left_join(tab_h4b_cont %>% select(Topic, Variant, `Continuous (per SD)`, `p (cont.)`),
+            by = c("Topic", "Variant")) %>%
+  arrange(Topic, Variant) %>%
+  as.data.frame() %>% print()
+```
+
+# Part 10: H3b -- Conditional Indirect Effects (Eq. 4.20--4.22)
+
+> **H3b:** The indirect effect of encouragement on attitude change through
+> experimental-period quality is stronger among participants with low
+> habitual OIEQ.
+
+Product of the treatment-quality path `a` from Equation (4.4) and the
+group-specific quality-attitude slopes from Equation (4.7). Confidence
+intervals by participant bootstrap within wave. Randomisation does not
+remove mediator-outcome confounding, so these are assumption-dependent.
+
+```{r h3b}
+indirect_once <- function(d, g) {
+  a_fit <- try(lm(as.formula(paste("q_primary ~ t_verbal + t_money +",
+                                   paste(COVARS, collapse = " + "))), d), silent = TRUE)
+  b_fit <- try(lm(as.formula(paste("y_abs ~ q_primary *", g,
+                                   "+ t_verbal + t_money +",
+                                   paste(COVARS, collapse = " + "))), d), silent = TRUE)
+  if (inherits(a_fit, "try-error") || inherits(b_fit, "try-error")) return(NULL)
+
+  a  <- coef(a_fit)["t_money"]
+  b1 <- coef(b_fit)["q_primary"]
+  b3 <- coef(b_fit)[str_subset(names(coef(b_fit)), "^q_primary:")]
+  if (length(b3) != 1 || any(is.na(c(a, b1, b3)))) return(NULL)
+
+  c(ie_low = unname(a * b1), ie_high = unname(a * (b1 + b3)),
+    diff = unname(a * b1 - a * (b1 + b3)))
+}
+
+h3b <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  imap_dfr(analysis_data, function(d, nm) {
+    point <- indirect_once(d, g)
+    if (is.null(point)) return(NULL)
+
+    boot <- replicate(N_BOOT, {
+      idx <- sample(nrow(d), replace = TRUE)
+      r <- indirect_once(d[idx, ], g)
+      if (is.null(r)) rep(NA_real_, 3) else r
+    })
+
+    tibble(wave = as.integer(str_remove(nm, "wave")), Variant = v,
+           Quantity = names(point), Estimate = point,
+           CI_low  = apply(boot, 1, quantile, .025, na.rm = TRUE),
+           CI_high = apply(boot, 1, quantile, .975, na.rm = TRUE),
+           N = nrow(filter(d, !is.na(q_primary))))
+  })
+})
+
+tab_h3b <- h3b %>%
+  transmute(Topic = WAVE_TOPICS[as.character(wave)], Variant,
+            Quantity = c(ie_low = "IE low", ie_high = "IE high",
+                         diff = "Difference")[Quantity],
+            Estimate = round(Estimate, 3),
+            CI_low = round(CI_low, 3), CI_high = round(CI_high, 3), N) %>%
+  arrange(Topic, Variant, Quantity)
+
+cat("H3b: conditional indirect effects\n")
+print(as.data.frame(tab_h3b))
+write_latex_table(tab_h3b, "tab_h3b_indirect_effects",
+                  caption = "H3b: conditional indirect effects, bootstrap CIs")
+```
+
+```{r h3b-sensitivity}
+
+
+
+# summary.medsens prints three lines of the form "... at which ACME = 0: <value>",
+# in the order rho, R^2* product, R^2~ product. They are selected by position,
+# because the notation of the R^2 terms differs between package versions.
+sens_summary_value <- function(sens, which = 1L) {
+  if (is.null(sens)) return(NA_real_)
+  txt <- tryCatch(capture.output(summary(sens)), error = function(e) character(0))
+  ln  <- grep("at which ACME", txt, value = TRUE)
+  if (length(ln) < which) return(NA_real_)
+  v <- regmatches(ln[which], regexpr("-?[0-9]*\\.?[0-9]+\\s*$", ln[which]))
+  if (length(v) == 0) NA_real_ else as.numeric(trimws(v))
+}
+
+sens_rho <- imap_dfr(analysis_data, function(d, nm) {
+  d <- d %>% filter(!is.na(q_primary), !is.na(y_abs), group_f != "verbal") %>%
+    mutate(treat = as.integer(group_f == "monetary"))
+  if (nrow(d) < 20 || n_distinct(d$treat) < 2) return(NULL)
+
+  f_m <- as.formula(paste("q_primary ~ treat +", paste(COVARS, collapse = " + ")))
+  f_y <- as.formula(paste("y_abs ~ treat + q_primary +", paste(COVARS, collapse = " + ")))
+
+  m_fit <- do.call(lm, list(formula = f_m, data = d))
+  y_fit <- do.call(lm, list(formula = f_y, data = d))
+
+  med <- tryCatch(
+    mediation::mediate(m_fit, y_fit, treat = "treat", mediator = "q_primary",
+                       sims = 1000, boot = FALSE),
+    error = function(e) NULL)
+  if (is.null(med)) return(NULL)
+
+  sens <- tryCatch(mediation::medsens(med, rho.by = 0.05, effect.type = "indirect"),
+                   error = function(e) NULL)
+
+  tibble(
+    wave     = as.integer(str_remove(nm, "wave")),
+    N        = nrow(d),
+    ACME     = as.numeric(med$d1)[1],
+    ACME_p   = as.numeric(med$d1.p)[1],
+    ADE      = as.numeric(med$z1)[1],
+    ADE_p    = as.numeric(med$z1.p)[1],
+    Prop_med = as.numeric(med$n1)[1],
+    rho_zero = sens_summary_value(sens, 1),
+    R2_zero  = sens_summary_value(sens, 2)
+  )
+})
+
+# R^2_M* x R^2_Y* equals rho^2 by construction. A mismatch means the value was
+# read from the wrong line; an NA means the pattern did not match at all.
+stopifnot(!any(is.na(sens_rho$rho_zero)), !any(is.na(sens_rho$R2_zero)))
+stopifnot(all(abs(sens_rho$R2_zero - sens_rho$rho_zero^2) < 0.01))
+
+
+tab_h3b_sens <- sens_rho %>%
+  transmute(Topic = WAVE_TOPICS[as.character(wave)],
+            N,
+            ACME = round(ACME, 3), p = round(ACME_p, 3),
+            ADE = round(ADE, 3),
+            `Prop. mediated` = round(Prop_med, 3),
+            `Rho at ACME = 0` = round(rho_zero, 2),
+            `R2 product` = round(R2_zero, 3))
+
+cat("Unmoderated mediation and sensitivity to unobserved confounding:\n")
+print(as.data.frame(tab_h3b_sens))
+write_latex_table(tab_h3b_sens, "tab_h3b_sensitivity",
+                  caption = "Mediation sensitivity: rho at which the ACME is zero")
+```
+
+```{r h3b-sensitivity-plot}
+# medsens region, one panel per wave.
+par(mfrow = c(1, 3))
+walk(names(analysis_data), function(nm) {
+  d <- analysis_data[[nm]] %>%
+    filter(!is.na(q_primary), !is.na(y_abs), group_f != "verbal") %>%
+    mutate(treat = as.integer(group_f == "monetary"))
+  if (nrow(d) < 20) return(invisible(NULL))
+
+  f_m <- as.formula(paste("q_primary ~ treat +", paste(COVARS, collapse = " + ")))
+  f_y <- as.formula(paste("y_abs ~ treat + q_primary +", paste(COVARS, collapse = " + ")))
+  m_fit <- do.call(lm, list(formula = f_m, data = d))
+  y_fit <- do.call(lm, list(formula = f_y, data = d))
+
+  med <- tryCatch(mediation::mediate(m_fit, y_fit, treat = "treat",
+                                     mediator = "q_primary", sims = 500),
+                  error = function(e) NULL)
+  if (is.null(med)) return(invisible(NULL))
+  sens <- tryCatch(mediation::medsens(med, rho.by = 0.1), error = function(e) NULL)
+  if (!is.null(sens)) plot(sens, main = WAVE_TOPICS[[str_remove(nm, "wave")]])
+})
+par(mfrow = c(1, 1))
+
+```
+
+
+# Part 11: Sensitivity Analyses
+
+Three axes, all prespecified: quality weighting, habitual-diet definition,
+and need for cognition. The diet definition is already varied throughout
+Parts 7 to 10, so only the other two are added here.
+
+```{r sensitivity-weighting}
+sens_w <- c(duration = "q_primary", unweighted = "exp_q_unw", log = "exp_q_log") %>%
+  imap_dfr(function(v, nm) {
+    across_waves(analysis_data, y = "y_abs",
+                 rhs = c(v, "t_verbal", "t_money", COVARS)) %>%
+      filter(term == v) %>% mutate(Weighting = nm)
+  })
+
+tab_sens_w <- sens_w %>%
+  transmute(Topic = topic, Weighting, Estimate = round(estimate, 3),
+            p = round(p.value, 3), Sig = stars(p.value), N = n) %>%
+  arrange(Topic, Weighting)
+
+cat("H2 under the three weightings:\n")
+print(as.data.frame(tab_sens_w))
+write_latex_table(tab_sens_w, "tab_sens_weighting",
+                  caption = "H2 under three quality weightings")
+```
+
+```{r sensitivity-category-set}
+sens_c <- c(primary = "q_primary", news_only = "exp_q_dur_news",
+            incl_search = "exp_q_dur_all") %>%
+  imap_dfr(function(v, nm) {
+    across_waves(analysis_data, y = "y_abs",
+                 rhs = c(v, "t_verbal", "t_money", COVARS)) %>%
+      filter(term == v) %>% mutate(`Category set` = nm)
+  })
+
+tab_sens_c <- sens_c %>%
+  transmute(Topic = topic, `Category set`, Estimate = round(estimate, 3),
+            p = round(p.value, 3), Sig = stars(p.value), N = n) %>%
+  arrange(Topic, `Category set`)
+
+print(as.data.frame(tab_sens_c))
+write_latex_table(tab_sens_c, "tab_sens_category_set",
+                  caption = "H2 under three category sets")
+```
+
+```{r sensitivity-nfc}
+# Reading rule fixed in advance: if the interaction survives, the moderator
+# is not merely a proxy for cognitive engagement; if not, that cannot be
+# ruled out, and the adjustment is partial given a reliability of .61.
+# Same specification as H4a, plus nfc. Anything else would confound the
+# adjustment with a change in the model.
+sens_nfc <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  across_waves(analysis_data, y = "y_abs",
+               rhs = c("t_verbal", "t_money", g,
+                       paste0("t_verbal:", g), paste0("t_money:", g),
+                       COVARS, "nfc")) %>%
+    filter(str_detect(term, "^t_verbal|^t_money")) %>%
+    mutate(Variant = v,
+           Arm = if_else(str_detect(term, "verbal"), "Verbal", "Monetary"),
+           Term = if_else(str_detect(term, ":"), "Interaction", "Low group"))
+})
+
+# Side by side with H4a, so the reader sees what the adjustment does rather
+# than two tables that have to be compared by hand.
+tab_sens_nfc <- h4a %>%
+  transmute(topic, Variant, Arm, Term, est_h4a = estimate, p_h4a = p.value, n_h4a = n) %>%
+  left_join(sens_nfc %>%
+              transmute(topic, Variant, Arm, Term,
+                        est_nfc = estimate, p_nfc = p.value, n_nfc = n),
+            by = c("topic", "Variant", "Arm", "Term")) %>%
+  filter(Term == "Interaction", Arm == "Monetary") %>%
+  transmute(Topic = topic, Variant,
+            `Without NFC` = round(est_h4a, 3), `p (without)` = round(p_h4a, 3),
+            `N (without)` = n_h4a,
+            `With NFC` = round(est_nfc, 3), `p (with)` = round(p_nfc, 3),
+            `N (with)` = n_nfc) %>%
+  arrange(Topic, Variant)
+
+cat("H4a monetary interaction, with and without need for cognition:\n")
+print(as.data.frame(tab_sens_nfc))
+write_latex_table(tab_sens_nfc, "tab_sens_nfc",
+                  caption = "H4a interaction adjusted for need for cognition")
+
+# The sample shrinks because NFC is missing for 107 participants, so part of
+# any change is compositional rather than due to the adjustment. Refitting
+# H4a on the NFC-complete sample separates the two.
+sens_nfc_same_n <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  sub <- map(analysis_data, ~ filter(.x, !is.na(nfc)))
+  across_waves(sub, y = "y_abs",
+               rhs = c("t_verbal", "t_money", g,
+                       paste0("t_verbal:", g), paste0("t_money:", g),
+                       COVARS)) %>%
+    filter(str_detect(term, "^t_money:")) %>%
+    mutate(Variant = v)
+})
+
+cat("\nH4a on the NFC-complete sample, without the adjustment:\n")
+sens_nfc_same_n %>%
+  transmute(Topic = topic, Variant, Estimate = round(estimate, 3),
+            p = round(p.value, 3), N = n) %>%
+  arrange(Topic, Variant) %>%
+  as.data.frame() %>% print()
+```
+# Part 12: Knowledge Outcome
+
+
+```{r knowledge-itt}
+cat("ITT on knowledge change:\n")
+kno_itt <- across_waves(analysis_data, y = "kno_signed",
+                        rhs = c("t_verbal", "t_money"))
+
+tab_kno_itt <- bind_rows(
+  present(kno_itt, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(kno_itt, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_kno_itt))
+write_latex_table(tab_kno_itt, "tab_knowledge_itt", caption = "ITT on knowledge change")
+
+# ANCOVA: post-test conditional on baseline, the prespecified robustness
+# check. It is more efficient than the difference score when the pre-post
+# correlation is below one, which it is here.
+cat("\nANCOVA: post-test knowledge conditional on baseline:\n")
+kno_ancova <- across_waves(analysis_data, y = "kno_post",
+                           rhs = c("t_verbal", "t_money", "kno_pre", COVARS))
+
+tab_kno_ancova <- bind_rows(
+  present(kno_ancova, "^t_verbal") %>% mutate(Arm = "Verbal", .after = Topic),
+  present(kno_ancova, "^t_money")  %>% mutate(Arm = "Monetary", .after = Topic)
+) %>% arrange(Topic, Arm)
+print(as.data.frame(tab_kno_ancova))
+write_latex_table(tab_kno_ancova, "tab_knowledge_ancova",
+                  caption = "Knowledge: ANCOVA robustness check")
+```
+```{r knowledge-quality}
+cat("Encountered quality and knowledge change:\n")
+kno_q <- across_waves(analysis_data, y = "kno_signed",
+                      rhs = c("q_primary", "t_verbal", "t_money", COVARS))
+
+tab_kno_q <- present(kno_q, "^q_primary$")
+print(as.data.frame(tab_kno_q))
+write_latex_table(tab_kno_q, "tab_knowledge_quality",
+                  caption = "Quality and knowledge change")
+```
+```{r knowledge-late}
+cat("Uptake LATE on knowledge change:\n")
+kno_late <- across_waves(analysis_data, y = "kno_signed",
+                         rhs = c("exp_topic_uptake_yn", COVARS),
+                         instruments = c("t_verbal", "t_money", COVARS))
+
+tab_kno_late <- kno_late %>%
+  filter(term == "exp_topic_uptake_yn") %>%
+  transmute(Topic = topic, Estimate = round(estimate, 3), SE = round(std.error, 3),
+            p = round(p.value, 3), Sig = stars(p.value), N = n,
+            `First-stage F` = round(first_stage_F, 2))
+print(as.data.frame(tab_kno_late))
+write_latex_table(tab_kno_late, "tab_knowledge_late",
+                  caption = "Uptake LATE on knowledge change")
+```
+```{r knowledge-moderation}
+# Knowledge analogue of H4b, for the same three diet definitions.
+kno_mod <- map_dfr(DIET_VARIANTS, function(v) {
+  g <- paste0("hab_", v, "_level_group")
+  across_waves(analysis_data, y = "kno_signed",
+               rhs = c(paste0("exp_topic_uptake_yn * ", g), COVARS),
+               instruments = c(paste0("t_verbal * ", g),
+                               paste0("t_money * ", g), COVARS)) %>%
+    filter(str_detect(term, "^exp_topic_uptake_yn")) %>%
+    mutate(Variant = v,
+           Term = if_else(str_detect(term, ":"), "Interaction", "Low group"))
+})
+
+tab_kno_mod <- present(kno_mod, ".", fit = FALSE) %>%
+  mutate(Variant = kno_mod$Variant, Term = kno_mod$Term, .after = Topic) %>%
+  mutate(`First-stage F` = round(kno_mod$first_stage_F, 2)) %>%
+  arrange(Topic, Variant, desc(Term))
+
+cat("Knowledge LATE by habitual-quality group:\n")
+print(as.data.frame(tab_kno_mod))
+write_latex_table(tab_kno_mod, "tab_knowledge_moderation",
+                  caption = "Knowledge LATE by habitual quality")
+```
+
+# Part 13: Detection Limits
+
+Minimum detectable effect at 80 per cent power and a two-sided level of .05,
+and Type S and Type M error at assumed true effects (Gelman & Carlin, 2014).
+Nothing is re-estimated; the standard errors come from the models above.
+```{r detection-limits}
+mde <- function(se, power = .80, alpha = .05) {
+  (qnorm(1 - alpha / 2) + qnorm(power)) * se
+}
+
+design_analysis <- function(true_effect, se, alpha = .05, n_sim = 2e5) {
+  z     <- qnorm(1 - alpha / 2)
+  power <- (1 - pnorm(z - true_effect / se)) + pnorm(-z - true_effect / se)
+  draws <- rnorm(n_sim, true_effect, se)
+  sig   <- abs(draws) > z * se
+  c(power        = power,
+    type_s       = pnorm(-z - true_effect / se) / power,
+    exaggeration = mean(abs(draws[sig])) / abs(true_effect))
+}
+
+focal <- bind_rows(
+  itt_abs    %>% filter(term == "t_money")   %>% mutate(Model = "ITT, absolute change"),
+  realized   %>% filter(term == "t_money")   %>% mutate(Model = "H1a, realization"),
+  qlevel_adj %>% filter(term == "t_money")   %>% mutate(Model = "Level of encountered OIEQ"),
+  h2_adj     %>% filter(term == "q_primary") %>% mutate(Model = "H2, quality on attitude"),
+  late       %>% filter(term == "exp_topic_uptake_yn") %>% mutate(Model = "LATE, uptake"),
+  h4a        %>% filter(Term == "Interaction", Arm == "Monetary") %>%
+              mutate(Model = paste0("H4a interaction (", DIET_SHORT[Variant], ")"))
+) %>%
+  transmute(Model, Topic = topic,
+            Estimate   = round(estimate, 3),
+            SE         = round(std.error, 3),
+            MDE        = round(mde(std.error), 3),
+            `Est./MDE` = round(abs(estimate) / mde(std.error), 2),
+            N = n)
+
+cat("Minimum detectable effect at 80% power, alpha = .05:\n")
+print(as.data.frame(focal))
+
+write_latex_table(focal, "tab_detection_limits",
+                  caption = "Minimum detectable effects")
+
+
+# The quality MDE expressed in within-wave SDs of the quality measure.
+cat("\nMDE for the level of encountered OIEQ, in within-wave SDs:\n")
+map_dfr(analysis_data, ~ tibble(sd_q = sd(.x$q_primary, na.rm = TRUE)), .id = "wave") %>%
+  mutate(wave = as.integer(str_remove(wave, "wave"))) %>%
+  left_join(qlevel_adj %>% filter(term == "t_money") %>% select(wave, std.error),
+            by = "wave") %>%
+  transmute(Topic       = WAVE_TOPICS[as.character(wave)],
+            SD          = round(sd_q, 3),
+            MDE         = round(mde(std.error), 3),
+            `MDE in SD` = round(mde(std.error) / sd_q, 2)) %>%
+  as.data.frame() %>% print()
+
+# Design analysis at assumed true effects. SEs are taken from the fitted
+# models rather than entered manually.
+set.seed(20260913)
+se_h4a  <- h4a %>% filter(Term == "Interaction", Arm == "Monetary",
+                          Variant == "news", wave == 1) %>% pull(std.error)
+se_late <- late %>% filter(term == "exp_topic_uptake_yn", wave == 1) %>% pull(std.error)
+
+tab_design <- tibble(Model = c(rep("H4a interaction, news", 3), rep("LATE, child support", 3)),
+                     SE    = c(rep(se_h4a, 3), rep(se_late, 3)),
+                     `True effect` = rep(c(0.20, 0.30, 0.40), 2)) %>%
+  mutate(res = map2(`True effect`, SE, design_analysis),
+         Power          = round(map_dbl(res, "power"), 2),
+         `Type S`       = round(100 * map_dbl(res, "type_s"), 1),
+         Exaggeration   = round(map_dbl(res, "exaggeration"), 1)) %>%
+  select(Model, `True effect`, SE, Power, `Type S`, Exaggeration) %>%
+  mutate(SE = round(SE, 3))
+
+cat("\nDesign analysis at plausible true effect sizes:\n")
+print(as.data.frame(tab_design))
+
+write_latex_table(tab_design, "tab_design_analysis", digits = 2,
+                  caption = "Type S and Type M errors at plausible effect sizes")
+```
+
+
+# Part 14: Hypothesis Summary
+
+Index of hypotheses and their principal table, plus a listing of the LaTeX
+fragments written by this script.
+
+```{r summary-table}
+summary_tab <- tribble(
+  ~Hypothesis, ~Question, ~Key_table,
+  "H1a", "Encouragement raises the probability of realizing a characterizable environment", "tab_h1a_realization",
+  "H1b", "More effort, higher encountered quality",            "tab_h1b_effort_quality",
+  "H2",  "Higher quality, more attitude change",               "tab_h2_quality_attitude",
+  "H3a", "Quality-attitude link stronger at low habitual quality", "tab_h3a_quality_moderation",
+  "H3b", "Indirect effect stronger at low habitual quality",   "tab_h3b_indirect_effects",
+  "H4a", "Treatment effect stronger at low habitual quality",  "tab_h4a_treatment_moderation",
+  "H4b", "Uptake LATE stronger at low habitual quality",       "tab_h4b_late_interaction"
+)
+
+print(as.data.frame(summary_tab))
+write_csv(summary_tab, file.path(table_dir, "hypothesis_index.csv"))
+
+
+print(list.files(table_dir, pattern = "\\.tex$"))
+```
+
+

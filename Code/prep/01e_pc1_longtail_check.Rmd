@@ -1,0 +1,361 @@
+---
+title: "News Population Correction: Top-N Review, PC1 Long Tail, and Final Visits"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = TRUE, message = TRUE)
+```
+
+# Overview
+
+Corrects the automated `is_news` classification through two complementary
+manual reviews and writes the corrected flag back onto the visit-level data.
+Four things, in this order:
+
+1. Export the Top-N most-visited domains for manual review, with a coverage
+   figure that makes the cutoff auditable
+2. Export the complementary case: PC1-carrying domains that fall outside the
+   cutoff purely on traffic
+3. Read both completed reviews back and merge them into one
+   `is_news_corrected` per domain
+4. Join that lookup onto the visits table and save `visits_final`
+
+## This script runs in two passes
+
+Steps 1--2 write workbooks that a human then fills in. Steps 3--4 read those
+completed workbooks back. On a first run the review files do not exist yet, so
+Part 4 onward is skipped with a message rather than failing. Rerun after the
+review is saved.
+
+The manual step between the passes is: open the exported `.xlsx`, fill in
+`is_news_corrected_status`, and save the candidate sheet as a semicolon-
+separated `.csv` at the path configured below.
+
+## Why a Top-N cutoff rather than a full census
+
+Manually reviewing every observed domain is neither standard practice nor
+necessary. Traffic in web-tracking data is heavily right-skewed: a small number
+of domains account for most visits, while the long tail consists of domains
+with a handful of visits each, contributing negligibly to aggregated media-diet
+measures. Web-tracking studies that classify domains by hand therefore restrict
+coding to the most-visited domains (e.g. Stier et al., 2020, who coded the top
+5,000 domains per country).
+
+The cutoff is reported as a share of total traffic, separately for the `pre`
+window, the experimental window, and overall, so the coverage claim is
+auditable rather than assumed.
+
+## The two reviews are complementary, not redundant
+
+| Review | Candidate pool | Catches |
+|---|---|---|
+| Top-N | The `n_top` most-visited domains, any `is_news` status | False positives and false negatives among domains that actually carry weight |
+| PC1 long tail | Domains with a PC1 score that fall outside the cutoff | Domains an external quality dataset already treats as news, missed by traffic rank alone |
+
+One candidate pool per review rather than separate news / non-news lists: the
+cutoff already spans both currently-flagged domains that may be wrong and
+unflagged domains that may have been missed.
+
+## Outputs
+
+| Object | Role |
+|---|---|
+| `news_correction_candidates.xlsx` | Top-N review workbook, with coverage and coding instructions |
+| `pc1_longtail_candidates_for_reclassification.xlsx` | Long-tail review workbook |
+| `is_news_corrected_lookup.csv` | One row per domain: `is_news`, `is_news_corrected`, `pc1` |
+| `domains_newly_classified_as_news.csv` | Domains the review added to the news population |
+| `visits_final.Rds` / `.RData` | Visit-level data with `is_news_corrected` and `pc1` attached |
+
+# Part 1: Setup
+
+```{r libraries}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(openxlsx)
+library(purrr)
+```
+
+```{r paths-config, include=FALSE}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+output_dir <- file.path(project_root, "Output", "01_visits")
+
+base_path   <- file.path(output_dir, "domain_reclass_base_with_apps_as_domains.Rds")
+visits_path <- file.path(output_dir, "visits_with_apps_as_domains.Rds")
+
+# Completed review files, saved by hand out of the exported workbooks.
+reviewed_paths <- c(
+  topn     = file.path(output_dir, "news_correction_candidates", "candidates-Tabelle 1.csv"),
+  longtail = file.path(output_dir, "pc1_longtail_candidates_for_reclassification",
+                       "pc1_longtail_candidates-Tabelle 1.csv")
+)
+```
+
+
+
+
+```{r constants-and-helpers}
+n_top <- 500
+
+save_both <- function(obj, name, dir = output_dir) {
+  assign(name, obj)
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  save(list = name, file = file.path(dir, paste0(name, ".RData")))
+}
+
+# Coding conventions shipped with both workbooks, so the reviewer sees the same
+# rules regardless of which file they open.
+correction_instructions <- tibble(
+  field = c("is_news_corrected_status", "correction_note", "visit_types_observed"),
+  instruction = c(
+    "
+    If the homepage displays news, not just on a specific topic, but also on a wider range of events from around the world, whether local or national, without requiring users to navigate to a subpage, it should be classified as a news website. One of: confirmed_news, confirmed_non_news, uncertain. Leave uncertain if unsure.",
+    "Short justification, e.g. 'regional newspaper, missed by the classifier' or 'shopping platform, correctly excluded'.",
+    "Observation channels only: 0 = web, 1 = mobile web, 2 = app. Descriptive; do not change."
+  )
+)
+
+export_review_workbook <- function(candidates, file, sheet_name, extra_sheets = list()) {
+  sheets <- c(setNames(list(candidates), sheet_name), extra_sheets,
+              list(instructions = correction_instructions))
+  write.xlsx(sheets, file = file.path(output_dir, file), overwrite = TRUE, asTable = TRUE)
+}
+```
+
+```{r load-inputs}
+domain_reclass_base <- readRDS(base_path)
+visits_with_apps_as_domains <- readRDS(visits_path)
+
+cat("Domains in reclassification base:", nrow(domain_reclass_base),
+    "| with a PC1 score:", sum(!is.na(domain_reclass_base$pc1)), "\n")
+```
+
+# Part 2: Top-N Review
+
+## Coverage of the cutoff
+
+Computed per window, since a ranking by total traffic does not necessarily
+produce the same coverage within `pre` alone or the experimental window alone.
+Adjust `n_top` and rerun if coverage is lower than the methods write-up needs.
+
+```{r coverage-check}
+top_n_domains <- domain_reclass_base %>%
+  arrange(desc(n_visits_total)) %>%
+  slice_head(n = n_top)
+
+coverage_summary <- tibble(
+  window = c("total", "pre", "experiment"),
+  visits_in_top_n = c(sum(top_n_domains$n_visits_total),
+                      sum(top_n_domains$pre_visits),
+                      sum(top_n_domains$experiment_visits)),
+  visits_overall  = c(sum(domain_reclass_base$n_visits_total),
+                      sum(domain_reclass_base$pre_visits),
+                      sum(domain_reclass_base$experiment_visits))
+) %>%
+  mutate(pct_covered = if_else(visits_overall > 0,
+                               round(100 * visits_in_top_n / visits_overall, 1), NA_real_))
+
+coverage_summary
+```
+
+## Candidate pool and export
+
+Domains carrying a PC1 score despite `is_news == FALSE` are pre-filled as
+`confirmed_news` and sorted first: an external quality dataset already treats
+them as a news or opinion source, which makes them the highest-information
+candidates. Everything else follows by traffic.
+
+`visit_types_observed` is a one-row-per-domain summary of the channels a domain
+was seen through (`0` web, `1` mobile web, `2` app), so `"0, 2"` means the same
+publisher domain was reached both through web tracking and through an app
+mapped to it.
+
+```{r topn-candidates-export}
+news_correction_candidates <- top_n_domains %>%
+  mutate(
+    pc1_backed_miss = !is_news & !is.na(pc1),
+    is_news_corrected_status = if_else(pc1_backed_miss, "confirmed_news", "uncertain"),
+    correction_note = if_else(
+      pc1_backed_miss,
+      "has a PC1 score despite not being flagged is_news; review whether this is a missed news source",
+      NA_character_)
+  ) %>%
+  arrange(desc(pc1_backed_miss), desc(n_visits_total)) %>%
+  dplyr::select(domain, category_1, category_2, category_3, app_cat, is_news, pc1,
+                n_visits_total, pre_visits, experiment_visits, visit_types_observed,
+                is_news_corrected_status, correction_note)
+
+export_review_workbook(
+  news_correction_candidates, "news_correction_candidates.xlsx", "candidates",
+  extra_sheets = list(coverage = coverage_summary %>%
+                        dplyr::select(window, pct_of_visits_covered_by_top_n = pct_covered)))
+
+cat("Top-N candidates:", nrow(news_correction_candidates),
+    "| pre-filled as confirmed_news via PC1 signal:",
+    sum(news_correction_candidates$is_news_corrected_status == "confirmed_news"), "\n")
+```
+
+# Part 3: PC1 Long-Tail Review
+
+The complementary case: domains carrying a PC1 score that fall outside the
+cutoff purely because they have too little traffic to rank. Individually
+low-weight, but a wrong `is_news` on a PC1-carrying domain leaves an
+unexplained gap in any composite quality score.
+
+Only the `is_news == FALSE` rows need an actual look. The `is_news == TRUE`
+rows already agree across both signals and are kept in the export for
+documentation only.
+
+```{r longtail-candidates-export}
+pc1_longtail_candidates <- domain_reclass_base %>%
+  filter(!is.na(pc1)) %>%
+  anti_join(top_n_domains %>% dplyr::select(domain), by = "domain") %>%
+  arrange(is_news, desc(n_visits_total)) %>%
+  mutate(
+    is_news_corrected_status = if_else(is_news, "confirmed_news", "uncertain"),
+    correction_note = if_else(
+      is_news,
+      "PC1 and is_news agree; documentation only, no review needed",
+      "has a PC1 score despite not being flagged is_news, and falls outside the Top-N traffic cutoff")
+  ) %>%
+  dplyr::select(domain, is_news, pc1, n_visits_total, pre_visits, experiment_visits,
+                visit_types_observed, category_1, category_2, category_3, app_cat,
+                is_news_corrected_status, correction_note)
+
+export_review_workbook(pc1_longtail_candidates,
+                       "pc1_longtail_candidates_for_reclassification.xlsx",
+                       "pc1_longtail_candidates")
+
+cat("PC1-carrying domains outside the Top-", n_top, " cutoff: ", nrow(pc1_longtail_candidates),
+    " | already is_news: ", sum(pc1_longtail_candidates$is_news),
+    " | actually needing review: ", sum(!pc1_longtail_candidates$is_news), "\n", sep = "")
+```
+
+# Part 4: Merging Both Reviews
+
+Everything below requires the completed review files. If they are missing, this
+is a first pass: do the manual review, then rerun.
+
+```{r review-files-present}
+reviews_complete <- all(file.exists(reviewed_paths))
+
+if (!reviews_complete) {
+  message("Review files not found:\n  ",
+          paste(reviewed_paths[!file.exists(reviewed_paths)], collapse = "\n  "),
+          "\nWorkbooks have been exported. Complete the review, save the candidate ",
+          "sheet as semicolon-separated CSV at those paths, then rerun.")
+}
+
+knitr::opts_chunk$set(eval = reviews_complete)
+```
+
+Both review files feed the same lookup. The Top-N review is bound first, so it
+takes precedence if a domain happens to appear in both.
+
+```{r read-reviews}
+all_reviewed <- imap_dfr(reviewed_paths, function(path, id) {
+  read_csv2(path, show_col_types = FALSE) %>%
+    mutate(domain = as.character(domain), pc1 = as.numeric(pc1), review = id) %>%
+    dplyr::select(domain, is_news_corrected_status, pc1, review)
+}) %>%
+  filter(!is.na(domain), domain != "") %>%
+  distinct(domain, .keep_all = TRUE)
+
+count(all_reviewed, review, is_news_corrected_status)
+```
+
+The PC1 column in the review files is descriptive; reviewers are not asked to
+change it. A disagreement with the base table means a review file was edited in
+a column it should not have been, or was exported with a different decimal
+convention. Worth seeing before it silently overwrites a score.
+
+```{r pc1-consistency-check}
+pc1_disagreements <- domain_reclass_base %>%
+  dplyr::select(domain, pc1_base = pc1) %>%
+  inner_join(all_reviewed %>% dplyr::select(domain, pc1_reviewed = pc1), by = "domain") %>%
+  filter(!is.na(pc1_base), !is.na(pc1_reviewed), abs(pc1_base - pc1_reviewed) > 1e-6)
+
+cat("Domains where the review file's PC1 differs from the base table:",
+    nrow(pc1_disagreements), "\n")
+if (nrow(pc1_disagreements) > 0) print(head(pc1_disagreements, 20))
+```
+
+The base score is authoritative; a score from a review file is used only where
+the base is missing. Domains never reviewed keep the automated `is_news`, so
+the correction can only ever move a domain that a human actually looked at.
+
+```{r build-lookup}
+is_news_corrected_lookup <- domain_reclass_base %>%
+  dplyr::select(domain, is_news, pc1_base = pc1) %>%
+  left_join(all_reviewed %>% dplyr::select(domain, is_news_corrected_status, pc1),
+            by = "domain") %>%
+  mutate(
+    pc1 = coalesce(pc1_base, pc1),
+    is_news_corrected = case_when(
+      is_news_corrected_status == "confirmed_news"     ~ TRUE,
+      is_news_corrected_status == "confirmed_non_news" ~ FALSE,
+      TRUE ~ is_news
+    )
+  ) %>%
+  dplyr::select(domain, is_news, is_news_corrected, pc1) %>%
+  distinct(domain, .keep_all = TRUE)
+
+# Every downstream join assumes one row per domain.
+stopifnot(n_distinct(is_news_corrected_lookup$domain) == nrow(is_news_corrected_lookup))
+
+write_csv(is_news_corrected_lookup, file.path(output_dir, "is_news_corrected_lookup.csv"))
+
+tibble(
+  domains        = nrow(is_news_corrected_lookup),
+  added_to_news  = sum(is_news_corrected_lookup$is_news_corrected & !is_news_corrected_lookup$is_news),
+  removed        = sum(!is_news_corrected_lookup$is_news_corrected & is_news_corrected_lookup$is_news),
+  news_after     = sum(is_news_corrected_lookup$is_news_corrected)
+)
+```
+
+```{r newly-news-domains}
+domains_newly_news <- is_news_corrected_lookup %>%
+  filter(is_news_corrected, !is_news) %>%
+  arrange(domain)
+
+print(domains_newly_news$domain)
+
+
+```
+
+# Part 5: Writing the Corrected Flag Back onto the Visits
+
+`is_news` from the automated classification is kept untouched alongside the
+corrected flag, so any downstream comparison between the two definitions is
+possible without rebuilding either. Content IDs outside the lookup retain the
+automated classification rather than becoming `NA`. PC1 stays `NA` for domains
+without a score and for app names that were never mapped to a publisher domain.
+
+```{r join-onto-visits}
+n_before <- nrow(visits_with_apps_as_domains)
+
+visits_final <- visits_with_apps_as_domains %>%
+  mutate(content_id = as.character(content_id), is_news = as.logical(is_news)) %>%
+  left_join(is_news_corrected_lookup %>% dplyr::select(domain, is_news_corrected, pc1),
+            by = c("content_id" = "domain"), relationship = "many-to-one") %>%
+  mutate(is_news_corrected = coalesce(is_news_corrected, is_news))
+
+stopifnot(nrow(visits_final) == n_before)
+
+tibble(
+  visit_rows        = nrow(visits_final),
+  is_news           = sum(visits_final$is_news, na.rm = TRUE),
+  is_news_corrected = sum(visits_final$is_news_corrected, na.rm = TRUE),
+  newly_news_rows   = sum(!visits_final$is_news & visits_final$is_news_corrected, na.rm = TRUE),
+  with_pc1          = sum(!is.na(visits_final$pc1))
+)
+
+save_both(visits_final, "visits_final")
+```

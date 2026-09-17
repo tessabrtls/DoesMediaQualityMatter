@@ -1,0 +1,25 @@
+Model,Topic,Estimate,SE,MDE,Est./MDE,N
+"ITT, absolute change",Child support,0.278,0.103,0.289,0.96,586
+"ITT, absolute change",Energy transition,0.021,0.101,0.283,0.07,598
+"ITT, absolute change",Cannabis,0.248,0.098,0.275,0.9,606
+"H1a, realization",Child support,0.285,0.034,0.094,3.03,586
+"H1a, realization",Energy transition,0.058,0.02,0.056,1.04,598
+"H1a, realization",Cannabis,0.205,0.034,0.095,2.17,606
+Level of encountered OIEQ,Child support,0.048,0.126,0.352,0.14,81
+Level of encountered OIEQ,Energy transition,-0.004,0.075,0.21,0.02,22
+Level of encountered OIEQ,Cannabis,0.044,0.051,0.142,0.31,76
+"H2, quality on attitude",Child support,1.095,0.759,2.126,0.52,81
+"H2, quality on attitude",Energy transition,5.209,3.248,9.1,0.57,22
+"H2, quality on attitude",Cannabis,0.234,1.142,3.198,0.07,76
+"LATE, uptake",Child support,0.636,0.295,0.827,0.77,558
+"LATE, uptake",Energy transition,0.042,0.393,1.102,0.04,565
+"LATE, uptake",Cannabis,0.859,0.436,1.223,0.7,567
+H4a interaction (All),Child support,-0.007,0.208,0.583,0.01,547
+H4a interaction (All),Energy transition,-0.225,0.209,0.585,0.39,549
+H4a interaction (All),Cannabis,-0.316,0.209,0.586,0.54,554
+H4a interaction (OIE-a),Child support,-0.485,0.225,0.629,0.77,465
+H4a interaction (OIE-a),Energy transition,0.176,0.229,0.642,0.27,467
+H4a interaction (OIE-a),Cannabis,0.379,0.232,0.65,0.58,468
+H4a interaction (OIE-c),Child support,-0.331,0.213,0.597,0.55,528
+H4a interaction (OIE-c),Energy transition,-0.169,0.213,0.597,0.28,531
+H4a interaction (OIE-c),Cannabis,0.133,0.214,0.6,0.22,536

@@ -1,0 +1,322 @@
+---
+title: "Visits Raw: Combining Web, Mobile Web, and App Visits"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+Builds one long-format `visits_raw` table by stacking three visit sources,
+web visits, mobile web visits, and app visits, into a single structure with
+unified columns. Kept separate from the app-visit and news-app-mapping
+document because this step is narrower and more mechanical: it only
+*combines* already-prepared sources, building web and mobile web visits
+from scratch but reusing app visits as-is.
+
+This is a **reduced first pass**. No timestamp parsing, no wave/group/period
+variables, and no domain categories yet, those come back in a later step,
+once re-evaluated on this cleaner base table.
+
+## Outputs
+
+| Object | Type | Role |
+|---|---|---|
+| `web_visits_raw.Rds` / `.RData` | Intermediate | Raw web-visit rows, pid-filtered |
+| `mobile_visits_raw.Rds` / `.RData` | Intermediate | Raw mobile-web-visit rows, pid-filtered |
+| `visits_raw.Rds` / `.RData` | Final | One long table stacking web, mobile web, and app visits, with a unified `content_id` key |
+
+## The `visit_type` and `content_id` design
+
+One generic key, `content_id`, instead of two mostly-empty columns
+(`domain` for web/mobile, `app_id` for apps). Its meaning depends on
+`visit_type`.
+
+| `visit_type` | Meaning | `content_id` holds |
+|---:|---|---|
+| `0` | Web visit | The visited `domain` |
+| `1` | Mobile web visit | The visited `domain` |
+| `2` | App visit | The `app_id` |
+
+`pageviews` (click count per view) exists only for web and mobile web
+visits. It is `NA` for `visit_type == 2` by construction, not a missing-data
+problem.
+
+# Part 1: Setup
+
+`data.table::fread()` instead of the `readr`-based helper used for app
+visits: auto-detects the delimiter and is far more memory-efficient at this
+table size. Filtering uses `data.table`'s `%in%` row filter rather than
+`dplyr::semi_join()`, which is more memory-hungry at this scale.
+
+```{r libraries}
+library(data.table)
+library(dplyr)
+```
+
+```{r paths-and-helper, include=TRUE}
+
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+code_dir <- file.path(project_root, "Code", "prep")
+pid_dir <- file.path(project_root, "Output", "00_setup")
+output_dir <- file.path(project_root, "Output", "01_visits")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+#data_dir <- ""
+
+# Saves as .Rds (readRDS() reuse) and .RData (load(), object under its own
+# name, matching how df1/df2/df3 are loaded elsewhere).
+save_both <- function(obj, name, dir = output_dir) {
+  assign(name, obj)
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  save(list = name, file = file.path(dir, paste0(name, ".RData")))
+  message("Saved ", name)
+}
+kept_cols <- c("pid", "visit_type", "content_id", "used_at", "duration", "pageviews")
+```
+
+```{r paths-and-helper-invis, include=FALSE}
+
+data_dir <- "~/Desktop/Masterarbeit/Data/download-2"
+
+
+
+
+```
+
+Valid-participant reference loaded once, up front, so every source is
+restricted right after import rather than only at the end.
+
+```{r valid-pids, include=TRUE}
+pid_lookup_february <- readRDS(file.path(pid_dir, "pid_lookup_february.Rds"))
+valid_pids <- as.character(pid_lookup_february$pid)
+```
+
+# Part 2: Raw File Paths
+
+Same 1 April 2023 onward restriction as the app-visit document, for
+consistency across the whole visits pipeline stage.
+
+```{r file-paths, include=TRUE}
+web_visit_paths <- c(
+  file.path(data_dir, "original/2023-04-01-to-2023-04-15-exports/web_visits.csv"),
+  file.path(data_dir, "fixed/2023-04-15-to-2023-05-01-exports/web_visits.csv"),
+  file.path(data_dir, "original/2023-05-01-to-2023-05-15-exports/web_visits.csv"),
+  file.path(data_dir, "original/2023-05-15-to-2023-06-01-exports/web_visits.csv"),
+  file.path(data_dir, "original/2023-06-01-to-2023-06-15-exports/web_visits.csv"),
+  file.path(data_dir, "original/2023-06-15-to-2023-07-01-exports/web_visits.csv"),
+  file.path(data_dir, "original/2023-07-01-to-2023-07-15-exports/web_visits.csv"),
+  file.path(data_dir, "original/2023-07-15-to-2023-08-01-exports/web_visits.csv")
+) |> unique()
+
+mobile_visit_paths <- c(
+  file.path(data_dir, "original/2023-04-01-to-2023-04-15-exports/mobile_visits.csv"),
+  file.path(data_dir, "fixed/2023-04-15-to-2023-05-01-exports/mobile_visits.csv"),
+  file.path(data_dir, "original/2023-05-01-to-2023-05-15-exports/mobile_visits.csv"),
+  file.path(data_dir, "original/2023-05-15-to-2023-06-01-exports/mobile_visits.csv"),
+  file.path(data_dir, "original/2023-06-01-to-2023-06-15-exports/mobile_visits.csv"),
+  file.path(data_dir, "original/2023-06-15-to-2023-07-01-exports/mobile_visits.csv"),
+  file.path(data_dir, "original/2023-07-01-to-2023-07-15-exports/mobile_visits.csv"),
+  file.path(data_dir, "original/2023-07-15-to-2023-08-01-exports/mobile_visits.csv")
+) |> unique()
+```
+
+## A leaner, `data.table`-based file reader
+
+Each file is trimmed to only the needed columns
+(`pid`/`domain`/`used_at`/`duration`, plus `pageviews` when present) right
+at read time, so a full-width raw table is never materialised in memory.
+
+```{r read-helper}
+read_visit_files <- function(file_paths, extra_cols = character(0)) {
+  rbindlist(lapply(file_paths, function(fp) {
+    message("Reading: ", fp)
+    dt <- fread(fp, showProgress = FALSE)
+    if ("p_id" %in% names(dt) && !"pid" %in% names(dt)) setnames(dt, "p_id", "pid")
+    if (!"pid" %in% names(dt)) {
+      stop("No pid column found in file: ", fp, "\nColumns detected: ", paste(names(dt), collapse = ", "))
+    }
+    # pid can be read as integer64 for large PIDs. Converting here, right
+    # after read, guarantees every downstream %in% filter compares character
+    # against character, regardless of which source file this came from.
+    dt[, pid := as.character(pid)]
+    want <- intersect(c("pid", "domain", "used_at", "duration", extra_cols), names(dt))
+    dt[, ..want]
+  }), fill = TRUE)
+}
+```
+
+# Part 3: Reading Web Visits
+
+Restricted to valid participants right after import; the pid-filtered raw
+table is saved for transparency and auditing, then its memory is freed as
+soon as the trimmed `web_visits` table exists.
+
+```{r web-visits, include=FALSE}
+web_visits_raw <- read_visit_files(web_visit_paths, extra_cols = "pageviews")
+web_visits_raw <- web_visits_raw[pid %in% valid_pids]
+save_both(web_visits_raw, "web_visits_raw")
+
+web_visits <- web_visits_raw %>%
+  mutate(pid = as.character(pid), visit_type = 0L, content_id = as.character(domain)) %>%
+  select(all_of(kept_cols))
+
+
+
+rm(web_visits_raw); gc()
+```
+
+# Part 4: Reading Mobile Web Visits
+
+`mobile_visits.csv` holds only domain-based mobile *web* visits. App
+visits are a separate source, loaded from the already-built `app_visits`
+table in Part 5, not read again from raw files here.
+
+```{r mobile-visits, include=FALSE}
+mobile_visits_raw <- read_visit_files(mobile_visit_paths, extra_cols = "pageviews")
+mobile_visits_raw <- mobile_visits_raw[pid %in% valid_pids]
+save_both(mobile_visits_raw, "mobile_visits_raw")
+
+mobile_visits <- mobile_visits_raw %>%
+  mutate(pid = as.character(pid), visit_type = 1L, content_id = as.character(domain)) %>%
+  select(all_of(kept_cols))
+
+
+rm(mobile_visits_raw); gc()
+```
+
+# Part 5: Loading App Visits
+
+`app_visits` was already built and pid-filtered in the app-visits step, so
+no further pid filtering is needed here. Only reshaped to match the same
+`kept_cols` structure as the web and mobile web tables.
+
+```{r app-visits, include=FALSE}
+app_visits_path <- file.path(output_dir, "app_visits.Rds")
+```
+
+```{r app-visits-load}
+app_visits <- readRDS(app_visits_path) %>%
+  mutate(pid = as.character(pid), visit_type = 2L, content_id = as.character(app_id), pageviews = NA) %>%
+  select(all_of(kept_cols))
+```
+
+# Part 6: Combining All Three Sources
+
+All three tables are already trimmed to identical `kept_cols`, so combining
+is a pure row-stack with no further column selection.
+
+```{r combine}
+visits_raw <- bind_rows(web_visits, mobile_visits, app_visits)
+```
+
+## Basic import diagnostics
+
+```{r import-diagnostics}
+cat("Rows (web):", nrow(web_visits),
+    "| Rows (mobile web):", nrow(mobile_visits),
+    "| Rows (app):", nrow(app_visits),
+    "| Rows (combined):", nrow(visits_raw), "\n")
+cat("Unique pids (combined):", n_distinct(visits_raw$pid), "\n")
+print(table(visits_raw$visit_type, useNA = "ifany"))
+cat("Missing content_id:", sum(is.na(visits_raw$content_id) | visits_raw$content_id == ""), "\n")
+cat("Missing pageviews (expected: all visit_type == 2):", sum(is.na(visits_raw$pageviews)), "\n")
+```
+
+## Diagnostic: restricting to `in_experiment`
+
+Pure diagnostic, `visits_raw` itself is not modified. Checks how many
+participants and rows would remain under an additional
+`in_experiment == TRUE` filter (experimental-wave participants, not just
+the February baseline population). Printed as a comparison rather than
+applied, since different downstream analyses may legitimately want either
+population.
+
+```{r experiment-diagnostic}
+experiment_pids <- pid_lookup_february$pid[pid_lookup_february$in_experiment == TRUE]
+
+n_pids_february   <- n_distinct(visits_raw$pid)
+n_pids_experiment <- length(intersect(unique(visits_raw$pid), experiment_pids))
+
+n_rows_february   <- nrow(visits_raw)
+n_rows_experiment <- sum(visits_raw$pid %in% experiment_pids)
+
+cat("Pids, February filter (current):", n_pids_february, "\n")
+cat("Pids, additionally in_experiment == TRUE:", n_pids_experiment, "\n")
+cat("Rows, February filter (current):", n_rows_february, "\n")
+cat("Rows, additionally in_experiment == TRUE:", n_rows_experiment, "\n")
+```
+
+# Part 7: Saving
+
+```{r save-final}
+glimpse(visits_raw)
+save_both(visits_raw, "visits_raw")
+```
+
+## Comment
+
+`visits_raw` at this stage has no parsed timestamp, no wave/period
+variable, and no domain category. Do not expect to filter by wave or
+category directly on `visits_raw`. Those variables are added in the next
+pipeline stage, which reads this exact `visits_raw` object as its starting
+point.
+
+
+# Part 8: Flagging Overall Tracking Activity
+
+`df1`/`df2`/`df3` have similar activity flags (`activity_visits_yn`,
+`bilendi_visits_yn`), but only for the 791 experiment participants, and
+only within each wave's own surveillance/intervention windows, not across
+the full tracking period. No ready-made flag exists for the complete
+February baseline.
+
+`was_active` fills that gap: TRUE if a participant has at least one
+tracked web, mobile web, or app visit anywhere in the tracking period,
+built directly from the pid sets computed in the pre-merge crosstab
+(Part 6) and joined onto `panelist_metadata_final`.
+
+```{r load panelist_metadata, include=FALSE}
+
+panelist_metadata_final <- readRDS(
+  "~/Desktop/Masterarbeit/MA_FINAL/Output/00_setup/panelist_metadata_final.rds"
+)
+```
+
+
+```{r was-active}
+pids_web    <- unique(web_visits$pid)
+pids_mobile <- unique(mobile_visits$pid)
+pids_app    <- unique(app_visits$pid)
+
+pids_with_any_activity <- union(union(pids_web, pids_mobile), pids_app)
+
+
+
+panelist_metadata_final <- panelist_metadata_final %>%
+  mutate(was_active = pid %in% pids_with_any_activity)
+
+cat("was_active == TRUE:", sum(panelist_metadata_final$was_active), "\n")
+cat("was_active == FALSE:", sum(!panelist_metadata_final$was_active), "\n")
+```
+
+Cross-check against experiment participation: experiment participation
+required an internet connection and working tracking, so `was_active`
+should be a superset of `in_experiment`. Any `in_experiment == TRUE` with
+`was_active == FALSE` would flag a data problem (e.g. a pid type mismatch
+like the earlier `integer64` issue) rather than a genuine case.
+
+```{r was-active-crosscheck}
+activity_vs_experiment <- table(
+  was_active = panelist_metadata_final$was_active,
+  in_experiment = panelist_metadata_final$in_experiment
+)
+print(activity_vs_experiment)
+```

@@ -1,0 +1,768 @@
+---
+title: "Descriptives, Coverage, and Group Composition"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE,
+                      fig.width = 10, fig.height = 5)
+```
+
+# Overview
+
+Descriptive layer over the analysis dataset built by `03a`. Estimation happens
+in `03b`; nothing here tests a hypothesis.
+
+| Part | Content |
+|---|---|
+| 1 | Setup, constants, helpers |
+| 2 | Descriptive statistics of the analysis variables |
+| 3 | Coverage by measure and wave, and the quality-coverage triage |
+| 4 | Randomization balance, joint test, and covariate missingness by arm |
+| 5 | Arm sizes, subgroup sizes, and their cross-tabulation |
+| 6 | Distributions of the outcome, the quality measures, effort, and the habitual diet |
+| 7 | Habitual quality against political position and vote intention |
+| 8 | Listing of the files written |
+
+## Outputs
+
+| File | Content |
+|---|---|
+| `tab_descriptives` | Analysis variables: mean, SD, min, max, median |
+| `tab_coverage` | Non-missing counts by measure and wave |
+| `tab_triage` | Three-way quality-coverage triage |
+| `tab_balance` | Covariate means by arm and wave, with per-variable p-values |
+| `tab_missingness_by_arm` | Missingness of prior engagement by arm |
+| `tab_composition_arms` | Arm sizes by wave |
+| `tab_composition_arm_by_diet` | Arm by habitual-quality cell sizes |
+| `fig_coverage_triage` | Where the quality measure loses the sample |
+| `fig_composition_arm_by_diet` | Habitual-quality composition within arms |
+| `fig_quality_density` | Habitual and encountered quality distributions |
+| `fig_effort_distribution` | Effort distribution by arm |
+| `fig_habitual_split` | Habitual quality with the median used for the split |
+| `fig_level_vs_diversity` | Level against diversity, by definition |
+| `fig_moderator_leaning` | Political self-placement by habitual-quality group |
+| `fig_moderator_vote` | Vote intention by habitual-quality group |
+| `fig_moderator_attitude_change` | Signed attitude change by habitual-quality group |
+
+Tables are written as LaTeX fragments and as CSV; figures as PNG.
+
+# Part 1: Setup
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(ggplot2)
+```
+
+```{r paths-config, echo=FALSE}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+input_dir <- file.path(project_root, "Output", "03_analysis_data")
+table_dir <- file.path(input_dir, "tables")
+fig_dir   <- file.path(input_dir, "figures")
+panelist_dir <- file.path(project_root, "Output", "00_setup")
+
+walk(c(table_dir, fig_dir), dir.create, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r config}
+WAVE_TOPICS <- c("1" = "Child support", "2" = "Energy transition", "3" = "Cannabis")
+DIET_VARIANTS <- c("overall", "news", "news_corrected")
+DIET_LABELS <- c(overall = "Overall scored diet", news = "Automated news diet",
+                 news_corrected = "Corrected news diet")
+COVARS_DESC <- c("att_baseline", "prior_engagement", "polknow_total",
+                 "pol_interest_general", "newsuse_online", "edu_time",
+                 "age", "gender_f")
+
+theme_set(theme_minimal(base_size = 11))
+ARM_COLOURS <- c(control = "grey60", verbal = "steelblue", monetary = "firebrick")
+```
+
+```{r helpers}
+write_latex_table <- function(df, file, digits = 3, caption = NULL) {
+  esc <- function(x) str_replace_all(as.character(x), "([_%&#])", "\\\\\\1")
+  body <- df %>%
+    mutate(across(where(is.numeric), ~ formatC(.x, format = "f", digits = digits))) %>%
+    mutate(across(everything(), ~ ifelse(is.na(.x) | .x == "NA", "--", esc(.x))))
+  header <- paste(paste0("\\textit{", esc(names(df)), "}"), collapse = " & ")
+  rows <- apply(body, 1, function(r)
+    paste0("      \\textit{", r[1], "} & ", paste(r[-1], collapse = " & "), " \\\\"))
+  lines <- c(paste0("\\begin{tabular}{", paste(rep("c", ncol(df)), collapse = " "), "}"),
+             "      \\hline", paste0("      ", header, " \\\\"), "      \\hline",
+             rows, "      \\hline", "    \\end{tabular}")
+  if (!is.null(caption)) lines <- c(paste0("% ", caption), lines)
+  writeLines(lines, file.path(table_dir, paste0(file, ".tex")))
+  write_csv(df, file.path(table_dir, paste0(file, ".csv")))
+  invisible(df)
+}
+
+save_fig <- function(p, name, width = 10, height = 5) {
+  print(p)
+  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = width, height = height, dpi = 300)
+}
+```
+
+```{r load-data}
+analysis_data <- readRDS(file.path(input_dir, "analysis_data_by_wave.Rds"))
+
+dat <- bind_rows(analysis_data) %>%
+  mutate(topic = factor(WAVE_TOPICS[as.character(wave)], levels = WAVE_TOPICS))
+
+cat("Participant-waves:", nrow(dat), "| participants:", n_distinct(dat$pid), "\n")
+```
+
+# Part 2: Descriptive Statistics
+
+Table 5.1 of the Results chapter. Quality variables are summarised on the
+participants for whom they exist, not on the full wave, so the `N` column
+differs by row by design.
+
+```{r descriptives}
+desc_vars <- tribble(
+  ~variable,             ~label,
+  "y_abs",               "Attitude change (absolute)",
+  "y_signed",            "Attitude change (signed)",
+  "kno_signed",          "Knowledge change",
+  "exp_topic_uptake_yn", "Topic-relevant uptake (0/1)",
+  "effort_count",        "Topic-relevant visits",
+  "topic_duration",      "Time on topic (s)",
+  "q_primary",           "Encountered quality",
+  "hab_overall_dw_pc1",  "Habitual quality (overall)",
+  "hab_news_corrected_dw_pc1", "Habitual quality (corrected news)",
+  "att_baseline",        "Baseline attitude",
+  "polknow_total",       "Political knowledge",
+  "pol_interest_general","Political interest",
+  "newsuse_online",      "Online news use (days/week)",
+  "age",                 "Age"
+)
+
+tab_desc <- desc_vars %>%
+  pmap_dfr(function(variable, label) {
+    x <- dat[[variable]]
+    x <- x[!is.na(x)]
+    tibble(Variable = label, N = length(x), Mean = mean(x), Std = sd(x),
+           Minimum = min(x), Maximum = max(x), Median = median(x))
+  })
+
+print(as.data.frame(tab_desc))
+write_latex_table(tab_desc, "tab_descriptives", caption = "Table 5.1: descriptives")
+```
+
+```{r descriptives-by-wave}
+tab_desc_wave <- dat %>%
+  group_by(Topic = topic) %>%
+  summarise(N = n(),
+            Uptake = mean(exp_topic_uptake_yn, na.rm = TRUE),
+            Effort = median(effort_count, na.rm = TRUE),
+            Quality = mean(q_primary, na.rm = TRUE),
+            Attitude = mean(y_abs, na.rm = TRUE),
+            .groups = "drop")
+
+print(as.data.frame(tab_desc_wave))
+write_latex_table(tab_desc_wave, "tab_descriptives_by_wave",
+                  caption = "Key measures by wave")
+```
+
+# Part 3: Coverage
+
+Non-missing counts per measure and wave. Uptake and the outcomes are complete
+by construction; the quality measures and the habitual measures are not.
+
+
+
+
+```{r coverage}
+tab_coverage <- dat %>%
+  group_by(Topic = topic) %>%
+  summarise(
+    N              = n(),
+    Outcome        = sum(!is.na(y_abs)),
+    Uptake         = sum(!is.na(exp_topic_uptake_yn)),
+    `Any uptake`   = sum(exp_topic_uptake_yn == 1, na.rm = TRUE),
+    `Quality (primary)`      = sum(!is.na(q_primary)),
+    `Quality (news)`         = sum(!is.na(exp_q_dur_news)),
+    `Quality (incl. search)` = sum(!is.na(exp_q_dur_all)),
+    `Habitual (overall)`     = sum(!is.na(hab_overall_dw_pc1)),
+    `Habitual (auto news)`   = sum(!is.na(hab_news_dw_pc1)),
+    `Habitual (corr. news)`  = sum(!is.na(hab_news_corrected_dw_pc1)),
+    # The covariate set is not complete, so adjusted models rest on fewer rows.
+    `Covariate-complete`     = sum(if_all(all_of(COVARS_DESC), ~ !is.na(.x))),
+    .groups = "drop"
+  )
+
+
+print(as.data.frame(tab_coverage))
+
+write_latex_table(tab_coverage, "tab_coverage", digits = 0,
+                  caption = "Coverage by measure and wave")
+```
+
+
+Three groups: no topic-relevant activity, activity without a scored domain,
+and at least one scored domain.
+
+```{r triage}
+tab_triage <- dat %>%
+  mutate(Group = case_when(
+    exp_topic_uptake_yn == 0 ~ "1: No topic-relevant activity",
+    is.na(q_primary)         ~ "2: Activity, no scored domain",
+    TRUE                     ~ "3: At least one scored domain")) %>%
+  count(Topic = topic, Group) %>%
+  group_by(Topic) %>%
+  mutate(Share = round(100 * n / sum(n), 1)) %>%
+  ungroup() %>%
+  rename(N = n)
+
+print(as.data.frame(tab_triage))
+write_latex_table(tab_triage, "tab_triage", digits = 1,
+                  caption = "Quality-coverage triage")
+```
+
+```{r fig-triage}
+p_triage <- tab_triage %>%
+  ggplot(aes(x = Topic, y = Share, fill = Group)) +
+  geom_col() +
+  geom_text(aes(label = N), position = position_stack(vjust = .5), size = 3.2) +
+  scale_fill_manual(values = c("grey75", "goldenrod", "steelblue")) +
+  labs(title = "Where the quality measure loses the sample",
+       subtitle = "Group 2 would be indistinguishable from group 1 under zero imputation",
+       y = "Share of participant-waves (%)", x = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+
+save_fig(p_triage, "fig_coverage_triage", height = 5)
+```
+
+
+# Part 4: Randomization Balance
+
+Per-variable means and p-values by arm for each wave, a joint test of
+assignment on the covariate set, and the missingness of the one incomplete
+covariate by arm.
+
+```{r balance}
+balance_vars <- c("att_baseline", "prior_engagement", "polknow_total",
+                  "pol_interest_general", "newsuse_online", "edu_time", "age",
+                  "hab_overall_dw_pc1")
+# Each wave randomizes separately, so balance is computed per wave.
+balance_one <- function(w) {
+  d <- filter(dat, wave == w)
+  means <- d %>%
+    dplyr::select(group_f, all_of(balance_vars)) %>%
+    pivot_longer(-group_f, names_to = "Variable") %>%
+    group_by(Variable, group_f) %>%
+    summarise(m = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = group_f, values_from = m)
+
+  pvals <- map_dfr(balance_vars, ~ tibble(
+    Variable = .x,
+    p = summary(aov(reformulate("group_f", .x), data = d))[[1]][["Pr(>F)"]][1]))
+
+  means %>% left_join(pvals, by = "Variable") %>%
+    mutate(Topic = WAVE_TOPICS[as.character(w)], .before = 1)
+}
+
+tab_balance <- map_dfr(1:3, balance_one) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+cat("Covariate balance across arms, by wave:\n")
+print(as.data.frame(tab_balance))
+
+# Joint test of assignment on the covariate set, alongside the per-variable
+# tests above.
+cat("\nJoint test of assignment on the covariate set:\n")
+map_dfr(1:3, function(w) {
+  d <- filter(dat, wave == w) %>% filter(if_all(all_of(balance_vars), ~ !is.na(.x)))
+  fit <- lm(reformulate(balance_vars, "as.integer(group_f == 'monetary')"), data = d)
+  f <- summary(fit)$fstatistic
+  tibble(Topic = WAVE_TOPICS[as.character(w)], N = nrow(d),
+         F = round(f[1], 2),
+         p = round(pf(f[1], f[2], f[3], lower.tail = FALSE), 3))
+}) %>% as.data.frame() %>% print()
+
+write_latex_table(tab_balance, "tab_balance", caption = "Covariate balance by wave")
+```
+```{r missingness-by-arm}
+# prior_engagement is the only covariate with missing values. Its missingness
+# is tested against arm, since adjusted models drop those rows.
+miss_by_arm <- dat %>%
+  group_by(Topic = topic, Arm = group_f) %>%
+  summarise(n = n(),
+            n_missing = sum(is.na(prior_engagement)),
+            pct = round(100 * mean(is.na(prior_engagement)), 1),
+            .groups = "drop")
+
+cat("Missingness of prior_engagement by arm:\n")
+print(as.data.frame(miss_by_arm))
+
+miss_test <- dat %>%
+  group_by(Topic = topic) %>%
+  summarise(p = chisq.test(table(group_f, is.na(prior_engagement)))$p.value,
+            .groups = "drop") %>%
+  mutate(p = round(p, 3))
+
+cat("\nChi-squared test of missingness against arm:\n")
+print(as.data.frame(miss_test))
+
+write_latex_table(miss_by_arm, "tab_missingness_by_arm", digits = 1,
+                  caption = "Missingness of prior engagement by treatment arm")
+```
+
+# Part 5: Group Composition
+
+Arm sizes, habitual-quality subgroup sizes, and the cross-tabulation of the
+two, with chi-squared tests of independence between arm and subgroup.
+
+```{r composition-arms}
+tab_arms <- dat %>%
+  count(Topic = topic, Arm = group_f) %>%
+  pivot_wider(names_from = Arm, values_from = n, values_fill = 0L) %>%
+  mutate(Total = rowSums(across(where(is.numeric))))
+
+print(as.data.frame(tab_arms))
+write_latex_table(tab_arms, "tab_composition_arms", digits = 0,
+                  caption = "Arm sizes by wave")
+```
+
+```{r composition-diet}
+tab_diet <- map_dfr(DIET_VARIANTS, function(v) {
+  dat %>%
+    count(Topic = topic, Group = .data[[paste0("hab_", v, "_level_group")]]) %>%
+    mutate(Definition = DIET_LABELS[[v]])
+}) %>%
+  mutate(Group = as.character(Group),
+         Group = if_else(is.na(Group), "missing", Group)) %>%
+  pivot_wider(names_from = Group, values_from = n, values_fill = 0L)
+
+print(as.data.frame(tab_diet))
+write_latex_table(tab_diet, "tab_composition_diet", digits = 0,
+                  caption = "Habitual-quality subgroup sizes")
+```
+
+```{r composition-arm-by-diet}
+tab_cross <- map_dfr(DIET_VARIANTS, function(v) {
+  dat %>%
+    filter(!is.na(.data[[paste0("hab_", v, "_level_group")]])) %>%
+    count(Topic = topic, Arm = group_f,
+          Diet = .data[[paste0("hab_", v, "_level_group")]]) %>%
+    mutate(Definition = DIET_LABELS[[v]])
+}) %>%
+  unite("Cell", Arm, Diet, sep = " / ") %>%
+  pivot_wider(names_from = Cell, values_from = n, values_fill = 0L)
+
+cat("Arm x habitual-quality cell sizes:\n")
+print(as.data.frame(tab_cross))
+write_latex_table(tab_cross, "tab_composition_arm_by_diet", digits = 0,
+                  caption = "Arm by habitual-quality cells")
+
+# Chi-squared test of arm against habitual-quality group, per definition
+# and wave.
+cat("\nChi-squared tests of arm against habitual-quality group:\n")
+map_dfr(DIET_VARIANTS, function(v) {
+  map_dfr(names(WAVE_TOPICS), function(w) {
+    d <- filter(dat, wave == as.integer(w), !is.na(.data[[paste0("hab_", v, "_level_group")]]))
+    tt <- table(d$group_f, d[[paste0("hab_", v, "_level_group")]])
+    tibble(Definition = DIET_LABELS[[v]], Topic = WAVE_TOPICS[[w]],
+           p = round(suppressWarnings(chisq.test(tt)$p.value), 3))
+  })
+}) %>% as.data.frame() %>% print()
+```
+
+```{r fig-composition}
+p_comp <- map_dfr(DIET_VARIANTS, function(v) {
+  dat %>%
+    filter(!is.na(.data[[paste0("hab_", v, "_level_group")]])) %>%
+    count(topic, group_f, Diet = .data[[paste0("hab_", v, "_level_group")]]) %>%
+    mutate(Definition = DIET_LABELS[[v]])
+}) %>%
+  ggplot(aes(x = group_f, y = n, fill = Diet)) +
+  geom_col(position = "fill") +
+  facet_grid(Definition ~ topic) +
+  scale_fill_manual(values = c(low = "goldenrod", high = "steelblue")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Habitual-quality composition within treatment arms",
+       subtitle = "Even splits indicate the moderator is not confounded with assignment",
+       x = NULL, y = NULL, fill = "Habitual quality") +
+  theme(legend.position = "bottom")
+
+save_fig(p_comp, "fig_composition_arm_by_diet", height = 7)
+```
+
+# Part 6: Distributions
+
+```{r fig-quality-density}
+p_q <- dat %>%
+  dplyr::select(topic, `Habitual (overall)` = hab_overall_dw_pc1,
+         `Habitual (corr. news)` = hab_news_corrected_dw_pc1,
+         `Encountered (experimental)` = q_primary) %>%
+  pivot_longer(-topic, names_to = "Measure", values_to = "pc1") %>%
+  filter(!is.na(pc1)) %>%
+  ggplot(aes(x = pc1, fill = Measure, colour = Measure)) +
+  geom_density(alpha = .25) +
+  facet_wrap(~ topic, nrow = 1) +
+  labs(title = "Domain quality: habitual diet versus experimental period",
+       subtitle = "Experimental quality rests on few visits per participant and is wider",
+       x = "PC1 (0-1)", y = "Density", fill = NULL, colour = NULL) +
+  theme(legend.position = "bottom")
+
+save_fig(p_q, "fig_quality_density")
+```
+
+```{r fig-attitude-density}
+p_att <- dat %>%
+  dplyr::select(topic, group_f, Pre = att_baseline, Post = att_post) %>%
+  pivot_longer(c(Pre, Post), names_to = "Block", values_to = "attitude") %>%
+  mutate(Block = factor(Block, levels = c("Pre", "Post"))) %>%
+  ggplot(aes(x = attitude, fill = Block)) +
+  geom_density(alpha = .4, adjust = 1.4) +
+  facet_grid(group_f ~ topic) +
+  scale_fill_manual(values = c(Pre = "grey60", Post = "firebrick")) +
+  labs(title = "Policy attitude before and after the information period",
+       subtitle = "1 = should not be introduced, 7 = should be introduced",
+       x = "Attitude", y = "Density", fill = NULL) +
+  theme(legend.position = "bottom")
+
+save_fig(p_att, "fig_attitude_density", height = 7)
+```
+
+```{r fig-attitude-change}
+p_chg <- dat %>%
+  filter(!is.na(y_signed)) %>%
+  ggplot(aes(x = y_signed, fill = group_f)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ topic, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = ARM_COLOURS) +
+  labs(title = "Signed attitude change by arm",
+       subtitle = "A symmetric spread around zero produces movement without direction",
+       x = "Post minus pre", y = "Participants", fill = NULL) +
+  theme(legend.position = "bottom")
+
+save_fig(p_chg, "fig_attitude_change")
+```
+
+```{r fig-quality-attitude}
+p_qa <- dat %>%
+  filter(!is.na(q_primary), !is.na(y_abs)) %>%
+  ggplot(aes(x = q_primary, y = y_abs)) +
+  geom_point(aes(colour = hab_overall_level_group), alpha = .6) +
+  geom_smooth(aes(colour = hab_overall_level_group), method = "lm", se = FALSE) +
+  facet_wrap(~ topic, nrow = 1) +
+  scale_colour_manual(values = c(low = "goldenrod", high = "steelblue"),
+                      na.value = "grey80") +
+  labs(title = "Encountered quality and attitude change, by habitual-quality group",
+       subtitle = "Descriptive; the H3a interaction is tested in 03b",
+       x = "Encountered quality (PC1)", y = "Absolute attitude change",
+       colour = "Habitual quality") +
+  theme(legend.position = "bottom")
+
+save_fig(p_qa, "fig_quality_vs_attitude")
+```
+
+```{r fig-uptake}
+p_up <- dat %>%
+  group_by(topic, group_f) %>%
+  summarise(rate = mean(exp_topic_uptake_yn, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  ggplot(aes(x = group_f, y = rate, fill = group_f)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(100 * rate), "%")), vjust = -.4, size = 3.2) +
+  facet_wrap(~ topic, nrow = 1) +
+  scale_fill_manual(values = ARM_COLOURS, guide = "none") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, .6)) +
+  labs(title = "Topic-relevant uptake by arm",
+       subtitle = "The behavioural first stage, descriptively",
+       x = NULL, y = "Share with any topic-relevant visit")
+
+save_fig(p_up, "fig_uptake_by_arm")
+```
+
+```{r fig-effort}
+p_eff <- dat %>%
+  filter(exp_topic_uptake_yn == 1) %>%
+  ggplot(aes(x = effort_count, fill = group_f)) +
+  geom_histogram(bins = 30, position = "identity", alpha = .5) +
+  facet_wrap(~ topic, nrow = 1) +
+  scale_x_log10() +
+  scale_fill_manual(values = ARM_COLOURS) +
+  labs(title = "Topic-relevant visits among participants who engaged",
+       subtitle = "Log scale; participants with no topic-relevant visit excluded",
+       x = "Visits (log scale)", y = "Participants", fill = NULL) +
+  theme(legend.position = "bottom")
+
+save_fig(p_eff, "fig_effort_distribution")
+```
+
+Level and diversity of the habitual diet, with the medians that define the
+subgroups. Level is the duration-weighted mean PC1, diversity its
+duration-weighted standard deviation; both are participant-level and
+constant across waves.
+
+```{r fig-habitual-split}
+p_hab <- map_dfr(DIET_VARIANTS, function(v) {
+  dat %>%
+    distinct(pid, .keep_all = TRUE) %>%
+    transmute(Definition = DIET_LABELS[[v]],
+              pc1 = .data[[paste0("hab_", v, "_dw_pc1")]])
+}) %>%
+  filter(!is.na(pc1))
+
+p_hab_med <- p_hab %>%
+  group_by(Definition) %>%
+  summarise(m = median(pc1), .groups = "drop")
+
+p_habitual_split <- p_hab %>%
+  ggplot(aes(x = pc1)) +
+  geom_density(fill = "steelblue", alpha = .25, colour = "steelblue") +
+  geom_vline(data = p_hab_med, aes(xintercept = m),
+             linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~ Definition, nrow = 1) +
+  labs(title = "Habitual quality and the median split",
+       subtitle = "Dashed line at the median used to form the subgroups",
+       x = "Duration-weighted PC1 (level)", y = "Density")
+
+print(p_habitual_split)
+save_fig(p_habitual_split, "fig_habitual_split", width = 11, height = 4)
+```
+
+```{r fig-level-vs-diversity}
+# Level against diversity per definition, with the two medians that define the
+# four subgroups.
+lvl_div <- map_dfr(DIET_VARIANTS, function(v) {
+  dat %>%
+    distinct(pid, .keep_all = TRUE) %>%
+    transmute(Definition = DIET_LABELS[[v]],
+              level     = .data[[paste0("hab_", v, "_dw_pc1")]],
+              diversity = .data[[paste0("hab_", v, "_dw_sd_pc1")]],
+              Subgroup  = .data[[paste0("hab_", v, "_level_diversity_group")]])
+}) %>%
+  filter(!is.na(level), !is.na(diversity), !is.na(Subgroup))
+
+lvl_div_med <- lvl_div %>%
+  group_by(Definition) %>%
+  summarise(m_level = median(level), m_div = median(diversity), .groups = "drop")
+
+p_level_vs_diversity <- lvl_div %>%
+  ggplot(aes(x = level, y = diversity, colour = Subgroup)) +
+  geom_point(alpha = .55, size = 1.1) +
+  geom_vline(data = lvl_div_med, aes(xintercept = m_level),
+             linetype = "dashed", colour = "grey30") +
+  geom_hline(data = lvl_div_med, aes(yintercept = m_div),
+             linetype = "dashed", colour = "grey30") +
+  facet_wrap(~ Definition, nrow = 1) +
+  labs(title = "Habitual media diet: level against diversity",
+       subtitle = "Dashed lines at the medians that define the subgroups",
+       x = "Duration-weighted PC1 (level)",
+       y = "Duration-weighted SD of PC1 (diversity)",
+       colour = NULL) +
+  theme(legend.position = "bottom")
+
+print(p_level_vs_diversity)
+save_fig(p_level_vs_diversity, "fig_level_vs_diversity", width = 11, height = 4.5)
+
+# Correlation between the two dimensions, per definition.
+lvl_div %>%
+  group_by(Definition) %>%
+  summarise(n = n(),
+            r = round(cor(level, diversity, use = "complete.obs"), 3),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+# Part 7: Habitual Quality against Political Position
+
+The moderation models treat habitual news quality as a media-exposure trait.
+This part compares the habitual-quality groups on left-right self-placement
+and on reported vote intention. Both variables are measured before treatment,
+so all arms are included.
+
+```{r metadata-inspect}
+meta_raw <- readRDS(file.path(panelist_dir, "panelist_metadata_final.Rds"))
+
+cat("Rows:", nrow(meta_raw), "| unique pids:", n_distinct(meta_raw$pid), "\n\n")
+print(grep("vot|party|partei|wahl|leaning|ideo|links|rechts|^pol", names(meta_raw),
+           value = TRUE, ignore.case = TRUE))
+```
+```{r metadata-join}
+LEANING_VAR <- "pol_attitude"      # left-right self-placement
+VOTE_VAR    <- "voting_decision_f"   # party, categorical
+MOD_VARIANT <- "news_corrected"    # diet definition carrying the moderation tests
+MOD_LEVELS  <- "median"          # "median" for the analysis split, "quartile" for four curves
+
+meta <- readRDS(file.path(panelist_dir, "panelist_metadata_final.Rds")) %>%
+  mutate(pid = as.character(pid)) %>%
+  dplyr::select(pid, all_of(c(LEANING_VAR, VOTE_VAR))) %>%
+  distinct(pid, .keep_all = TRUE)
+
+n_before <- nrow(dat)
+dat_pol <- dat %>% left_join(meta, by = "pid")
+stopifnot(nrow(dat_pol) == n_before)
+
+cat("Coverage of the joined variables:\n")
+dat_pol %>%
+  summarise(across(all_of(c(LEANING_VAR, VOTE_VAR)),
+                   list(n = ~ sum(!is.na(.x)), pct = ~ round(100 * mean(!is.na(.x)), 1)))) %>%
+  as.data.frame() %>% print()
+```
+Grouping variable for the figures below. `MOD_LEVELS` switches between the
+median split used in the models and a quartile split.
+
+```{r moderator-groups}
+hab_var <- paste0("hab_", MOD_VARIANT, "_dw_pc1")
+
+dat_pol <- dat_pol %>%
+  mutate(Diet = if (MOD_LEVELS == "quartile") {
+    cut(.data[[hab_var]],
+        breaks = quantile(.data[[hab_var]], probs = seq(0, 1, .25), na.rm = TRUE),
+        labels = c("Q1 lowest", "Q2", "Q3", "Q4 highest"),
+        include.lowest = TRUE)
+  } else {
+    factor(.data[[paste0("hab_", MOD_VARIANT, "_level_group")]],
+           levels = c("low", "high"), labels = c("Low", "High"))
+  })
+
+DIET_COLOURS <- if (nlevels(dat_pol$Diet) == 2) {
+  c("Low" = "firebrick", "High" = "steelblue")
+} else {
+  setNames(c("firebrick", "darkorange", "darkgreen", "steelblue"),
+           levels(dat_pol$Diet))
+}
+
+cat("\nCell sizes by habitual-quality group and wave:\n")
+dat_pol %>% count(topic, Diet) %>%
+  pivot_wider(names_from = Diet, values_from = n, values_fill = 0L) %>%
+  as.data.frame() %>% print()
+```
+Two plot helpers: a density for continuous variables and a dodged bar chart
+for categorical ones. Both colour by the habitual-quality group.
+
+```{r moderator-plot-helpers}
+plot_density <- function(d, var, title, subtitle, xlab, facet_wave = TRUE, bw = 0.8) {
+  p <- d %>%
+    rename(x = all_of(var)) %>%
+    filter(!is.na(x), !is.na(Diet)) %>%
+    ggplot(aes(x = x, colour = Diet)) +
+    geom_density(linewidth = .8, bw = bw) +
+    scale_colour_manual(values = DIET_COLOURS) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = "Density",
+         colour = "Habitual news quality") +
+    theme(legend.position = "right")
+  if (facet_wave) p + facet_wrap(~ topic, ncol = 1, scales = "free_y") else p
+}
+
+plot_composition <- function(d, var, title, subtitle, xlab) {
+  d %>%
+    rename(Category = all_of(var)) %>%
+    filter(!is.na(Category), !is.na(Diet)) %>%
+    count(Diet, Category) %>%
+    group_by(Diet) %>% mutate(Share = 100 * n / sum(n)) %>% ungroup() %>%
+    ggplot(aes(x = Category, y = Share, fill = Diet)) +
+    geom_col(position = position_dodge(width = .8), width = .75) +
+    scale_fill_manual(values = DIET_COLOURS) +
+    labs(title = title, subtitle = subtitle, x = xlab,
+         y = "Share within habitual-quality group (%)",
+         fill = "Habitual news quality") +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          legend.position = "right")
+}
+```
+
+
+```{r moderator-figures}
+p_leaning <- dat_pol %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  rename(x = all_of(LEANING_VAR)) %>%
+  filter(!is.na(x), !is.na(Diet)) %>%
+  count(Diet, x) %>%
+  group_by(Diet) %>% mutate(Share = 100 * n / sum(n)) %>% ungroup() %>%
+  ggplot(aes(x = factor(x), y = Share, fill = Diet)) +
+  geom_col(position = position_dodge(width = .8), width = .75) +
+  scale_fill_manual(values = DIET_COLOURS) +
+  labs(title = "Political self-placement by habitual news quality",
+       subtitle = "One observation per participant; all arms",
+       x = "Left-right self-placement", y = "Share within group (%)",
+       fill = "Habitual news quality")
+
+save_fig(p_leaning, "fig_moderator_leaning", height = 4)
+
+# Vote intention, party choices only, ordered left to right.
+PARTY_ORDER <- c("Linke", "Gruene", "SPD", "FDP", "CDU/CSU", "AFD")
+
+p_vote <- dat_pol %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  filter(.data[[VOTE_VAR]] %in% PARTY_ORDER) %>%
+  mutate(across(all_of(VOTE_VAR), ~ factor(.x, levels = PARTY_ORDER))) %>%
+  plot_composition(VOTE_VAR,
+                   "Vote intention by habitual news quality",
+                   "Party choices only, ordered left to right; one observation per participant",
+                   "Reported vote")
+p_vote <- dat_pol %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  filter(.data[[VOTE_VAR]] %in% PARTY_ORDER) %>%
+  mutate(across(all_of(VOTE_VAR), ~ factor(.x, levels = PARTY_ORDER))) %>%
+  plot_composition(VOTE_VAR,
+                   "Vote intention by habitual news quality",
+                   "Party choices only, ordered left to right; one observation per participant",
+                   "Reported vote")
+
+
+
+save_fig(p_vote, "fig_moderator_vote", height = 5)
+
+# Signed attitude change by habitual-quality group, faceted by wave.
+p_change <- dat_pol %>%
+  plot_density("y_signed",
+               "Signed attitude change by habitual news quality",
+               "Participant-waves, all arms; dashed line at no change",
+               "Attitude change (post minus pre)", bw = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40")
+save_fig(p_change, "fig_moderator_attitude_change", height = 7)
+
+
+
+```
+Numerical counterparts to the two figures above.
+
+```{r moderator-association}
+cat("Association between habitual quality and political position:\n")
+dat_pol %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  summarise(n = sum(!is.na(.data[[hab_var]]) & !is.na(.data[[LEANING_VAR]])),
+            r = round(cor(.data[[hab_var]], .data[[LEANING_VAR]],
+                          use = "complete.obs"), 3)) %>%
+  as.data.frame() %>% print()
+
+cat("\nMean habitual quality by reported vote:\n")
+dat_pol %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  filter(!is.na(.data[[VOTE_VAR]])) %>%
+  group_by(Vote = .data[[VOTE_VAR]]) %>%
+  summarise(n = n(), mean_quality = round(mean(.data[[hab_var]], na.rm = TRUE), 3),
+            .groups = "drop") %>%
+  arrange(desc(mean_quality)) %>%
+  as.data.frame() %>% print()
+
+
+
+d1 <- dat_pol %>% distinct(pid, .keep_all = TRUE)
+
+cat("Self-placement against habitual quality: r =",
+    round(cor(d1[[hab_var]], d1[[LEANING_VAR]], use = "complete.obs"), 3), "\n")
+
+cat("Vote intention against habitual-quality group: p =",
+    round(chisq.test(table(d1[[VOTE_VAR]], d1$Diet))$p.value, 3), "\n")
+```
+
+# Part 8: Saved Files
+
+```{r file-list}
+cat("Tables:\n"); print(list.files(table_dir, pattern = "\\.tex$"))
+cat("\nFigures:\n"); print(list.files(fig_dir, pattern = "\\.png$"))
+```

@@ -1,0 +1,10 @@
+Topic,Variant,Split,p (split),F (split),N (split),Continuous (per SD),p (cont.),F (cont.),N (cont.)
+Cannabis,news,1.8,0.098,6.61,468,0.435,0.272,10.41,468
+Cannabis,news_corrected,0.148,0.872,11.04,536,0.119,0.723,10.85,536
+Cannabis,overall,-0.875,0.336,7.51,554,-0.367,0.399,9.74,554
+Child support,news,-1.175,0.06,17.92,465,-0.241,0.405,17.7,465
+Child support,news_corrected,-1.129,0.091,21.47,528,0.011,0.974,17.99,528
+Child support,overall,0.06,0.919,21.27,547,0.012,0.965,21.23,547
+Energy transition,news,0.61,0.458,9.61,467,0.088,0.815,9.88,467
+Energy transition,news_corrected,-0.619,0.417,10.97,531,-1.222,0.006,8.78,531
+Energy transition,overall,-0.821,0.329,11.12,549,-0.822,0.065,7.79,549

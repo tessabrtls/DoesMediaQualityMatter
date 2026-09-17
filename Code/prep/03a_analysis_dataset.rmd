@@ -1,0 +1,402 @@
+---
+title: "Analysis Dataset Assembly"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+Merges the four construct files from `02a`--`02c` with the wave survey files
+into one analysis dataset per wave. This is the only place where merging
+happens; `03b` estimates and never joins.
+
+Concentrating the merge here is deliberate. In the earlier pipeline the
+same exposure was merged in five separate scripts, and a pre-treatment
+habitual measure was silently substituted for the experimental exposure in
+three of them (Appendix G). The assertions in Part 5 make that failure mode
+impossible to repeat: prefixes are disjoint, row counts are checked, and
+every variable's non-missing count is verified against its expected coverage
+before the file is saved.
+
+## Inputs
+
+| Source | File | Level |
+|---|---|---|
+| `02a` | `habitual_media_diet_FINAL.csv` | `pid` |
+| `02b` | `experimental_topic_uptake_by_wave.Rds` | `pid` x `wave` |
+| `02b` | `experimental_quality_by_wave.Rds` | `pid` x `wave` |
+| `02c` | `attitude_outcomes_by_wave.Rds` | `pid` x `wave` |
+| survey | `df1`--`df3` | `pid`, one file per wave |
+
+## Output
+
+| Object | Content |
+|---|---|
+| `analysis_data_by_wave.Rds` | Named list of three data frames, one per wave |
+| `analysis_data_wave{1,2,3}.csv` | The same, flat, for inspection |
+| `variable_roles.csv` | Every analysis variable with its role and expected coverage |
+
+## Naming convention
+
+Prefixes are disjoint by construction, so a habitual measure can never be
+mistaken for an experimental one.
+
+| Prefix | Timing | Role |
+|---|---|---|
+| `hab_` | 30 days before the wave's search task | Moderator, pre-treatment |
+| `exp_` | During the wave's information period | Exposure and mediator, post-treatment |
+| `att_`, `kno_` | Pre and post survey blocks of the wave | Outcomes |
+| none | Baseline survey or assignment | Treatment, covariates |
+
+# Part 1: Setup
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(purrr)
+library(stringr)
+```
+
+```{r paths-config, echo=FALSE}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+data_dir     <- "~/Desktop/Masterarbeit/Data"
+
+dir_02a <- file.path(project_root, "Output", "02_media_quality/habitual_media_diet_baseline")
+dir_02b <- file.path(project_root, "Output", "02a_experimental_visits")
+dir_02c <- file.path(project_root, "Output", "02c_outcomes")
+output_dir <- file.path(project_root, "Output", "03_analysis_data")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+load(file.path(data_dir, "df1_final_ac.Rdata"))
+load(file.path(data_dir, "df2_final_ac.Rdata"))
+load(file.path(data_dir, "df3_final_ac.Rdata"))
+
+waves <- list("1" = df1, "2" = df2, "3" = df3)
+```
+
+```{r config-constants}
+WAVE_TOPICS <- c("1" = "Basic child support",
+                 "2" = "Renewable-energy transition",
+                 "3" = "Cannabis legalisation")
+
+# Habitual diet definitions carried through the whole analysis (Sec. 4.10).
+DIET_VARIANTS <- c("overall", "news", "news_corrected")
+
+# Two-item NFC short form, used only in the Section 4.10 sensitivity check.
+NFC_ITEMS <- c("cog_nfc1", "cog_nfc2")
+
+num <- function(x) as.numeric(unclass(x))
+```
+
+# Part 2: Analysis Samples
+
+```{r analysis-pids}
+analysis_pids <- imap_dfr(waves, function(d, w) {
+  tibble(pid = as.character(d$pid), wave = as.integer(w))
+}) %>%
+  distinct(pid, wave)
+
+stopifnot(!any(duplicated(analysis_pids)))
+analysis_pids %>% count(wave, name = "n") %>% as.data.frame() %>% print()
+```
+
+# Part 3: Treatment, Outcomes, and Covariates from the Survey Files
+
+Treatment is taken from `group_f` and recoded into the two instruments used
+in the IV models. `z_verbal` and `z_money` each compare one arm against
+control and set the other arm to `NA`, so that each instrument identifies a
+single contrast.
+
+Covariates follow Table 3.1. Baseline attitude and prior issue engagement
+are wave-specific; the rest come from the baseline survey.
+
+```{r survey-variables}
+survey_vars <- imap_dfr(waves, function(d, w) {
+  tibble(
+    pid  = as.character(d$pid),
+    wave = as.integer(w),
+
+    # Treatment and instruments
+    group_f  = d$group_f,
+    z_verbal = case_when(d$group_f == "control" ~ 0L,
+                         d$group_f == "verbal"  ~ 1L,
+                         TRUE ~ NA_integer_),
+    z_money  = case_when(d$group_f == "control"  ~ 0L,
+                         d$group_f == "monetary" ~ 1L,
+                         TRUE ~ NA_integer_),
+
+    # Covariates (Table 3.1)
+    att_baseline        = num(d$gen_pol_attitude_topic_pre),
+    prior_engagement    = num(d$SR_visit_internet_pre),
+    polknow_total       = num(d$polknow_total),
+    pol_interest_general = num(d$pol_interest_general),
+    newsuse_online      = num(d$newsuse_online),
+    edu_time            = num(d$edu_time),
+    age                 = num(d$age),
+    gender_f            = as.factor(d$gender_f),
+
+    # Supplied uptake, retained for the Appendix A.2 comparison only
+    url_int_visits_yn = num(d$url_int_visits_yn)
+  )
+})
+
+stopifnot(nrow(survey_vars) == nrow(analysis_pids))
+
+cat("Instrument coding by wave:\n")
+survey_vars %>%
+  count(wave, group_f, z_verbal, z_money) %>%
+  as.data.frame() %>% print()
+
+cat("\nCovariate missingness (Table 3.1 covariates should be complete):\n")
+survey_vars %>%
+  group_by(wave) %>%
+  summarise(across(c(att_baseline, prior_engagement, polknow_total,
+                     pol_interest_general, newsuse_online, edu_time, age),
+                   ~ sum(is.na(.x))),
+            gender_f = sum(is.na(gender_f)),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+## Need for cognition
+
+Measured once per participant at study entry, so it is available in the
+wave file where a participant first appears and missing in later ones. It
+is reconstructed here as a person-level constant and used only in the
+Section 4.10 sensitivity analysis, not in the main covariate set: the two
+items correlate at r = .44 (Spearman-Brown .61), and including it would
+drop 107 participants from models that are already small.
+
+```{r need-for-cognition}
+nfc_baseline <- imap_dfr(waves, function(d, w) {
+  tibble(pid = as.character(d$pid), wave = as.integer(w),
+         cog_nfc1 = num(d[[NFC_ITEMS[1]]]),
+         cog_nfc2 = num(d[[NFC_ITEMS[2]]]))
+}) %>%
+  filter(!is.na(cog_nfc1), !is.na(cog_nfc2)) %>%
+  arrange(pid, wave) %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  transmute(pid, nfc = rowMeans(cbind(cog_nfc1, cog_nfc2)),
+            nfc_item1 = cog_nfc1, nfc_item2 = cog_nfc2)
+
+cat("NFC available for", nrow(nfc_baseline), "participants\n")
+cat("Two-item correlation:", round(cor(nfc_baseline$nfc_item1,
+                                       nfc_baseline$nfc_item2), 3), "\n")
+r_nfc <- cor(nfc_baseline$nfc_item1, nfc_baseline$nfc_item2)
+cat("Spearman-Brown reliability:", round(2 * r_nfc / (1 + r_nfc), 3), "\n")
+```
+
+# Part 4: Construct Files
+
+Habitual measures are renamed with a `hab_` prefix on read, before they can
+reach any downstream object. The habitual file is at participant level and
+is joined to every wave.
+
+```{r load-constructs}
+# Already wide and hab_-prefixed, one row per participant.
+hab_keep <- as.vector(outer(
+  DIET_VARIANTS,
+  c("_dw_pc1", "_dw_sd_pc1", "_level_group", "_diversity_group",
+    "_level_diversity_group"),
+  function(v, s) paste0("hab_", v, s)))
+
+habitual <- read_csv(file.path(dir_02a, "habitual_media_diet_FINAL.csv"),
+                     show_col_types = FALSE) %>%
+  mutate(pid = as.character(pid)) %>%
+  select(pid, meets_activity_threshold, all_of(hab_keep))
+
+stopifnot(!any(duplicated(habitual$pid)))
+
+uptake   <- readRDS(file.path(dir_02b, "experimental_topic_uptake_by_wave.Rds"))
+quality  <- readRDS(file.path(dir_02b, "experimental_quality_by_wave.Rds"))
+outcomes <- readRDS(file.path(dir_02c, "attitude_outcomes_by_wave.Rds"))
+
+cat("habitual:", nrow(habitual), "participants |",
+    "uptake:", nrow(uptake), "| quality:", nrow(quality),
+    "| outcomes:", nrow(outcomes), "participant-waves\n")
+
+# Prefixes must stay disjoint (Appendix G).
+stopifnot(!any(str_starts(names(habitual)[-1], "exp_")))
+stopifnot(all(str_starts(setdiff(names(quality), c("pid", "wave")), "exp_|n_")))
+```
+
+
+# Part 5: Merge and Assertions
+
+```{r merge}
+analysis_long <- analysis_pids %>%
+  left_join(survey_vars, by = c("pid", "wave")) %>%
+  left_join(outcomes,    by = c("pid", "wave")) %>%
+  left_join(uptake,      by = c("pid", "wave")) %>%
+  left_join(quality,     by = c("pid", "wave")) %>%
+  left_join(habitual,    by = "pid") %>%
+  left_join(nfc_baseline %>% select(pid, nfc), by = "pid") %>%
+  mutate(topic = WAVE_TOPICS[as.character(wave)])
+
+# No join may add or duplicate rows.
+stopifnot(nrow(analysis_long) == nrow(analysis_pids))
+stopifnot(!any(duplicated(analysis_long[c("pid", "wave")])))
+
+# No name collision may have produced .x / .y variants.
+stopifnot(!any(str_detect(names(analysis_long), "\\.(x|y)$")))
+```
+
+Each variable's non-missing count is checked against what its construction
+permits. This is the check that would have caught the Appendix G error: a
+habitual measure used as an experimental exposure shows several hundred
+non-missing cells per wave where the experimental measure permits at most
+a hundred.
+
+```{r coverage-assertions}
+coverage <- analysis_long %>%
+  group_by(wave) %>%
+  summarise(
+    n                = n(),
+    outcome_abs      = sum(!is.na(att_abs)),
+    uptake           = sum(!is.na(exp_topic_uptake_yn)),
+    quality_primary  = sum(!is.na(exp_q_dur)),
+    quality_news     = sum(!is.na(exp_q_dur_news)),
+    quality_all      = sum(!is.na(exp_q_dur_all)),
+    hab_overall      = sum(!is.na(hab_overall_dw_pc1)),
+    nfc              = sum(!is.na(nfc)),
+    .groups = "drop"
+  )
+
+cat("Non-missing counts by wave:\n")
+coverage %>% as.data.frame() %>% print()
+
+# Uptake is coded 0 where there was no topic-relevant visit, so it must be
+# complete. Quality is left NA and must not exceed its known coverage.
+stopifnot(all(coverage$uptake == coverage$n))
+stopifnot(all(coverage$outcome_abs == coverage$n))
+stopifnot(all(coverage$quality_primary <= coverage$n))
+stopifnot(all(coverage$quality_news <= coverage$quality_primary))
+
+# A quality measure with more non-missing cells than the primary one would
+# mean a pre-treatment variable has been merged in its place.
+if (any(coverage$quality_primary > 200)) {
+  stop("Experimental quality coverage exceeds what the construction permits. ",
+       "Check that exp_q_* comes from 02b and not from the habitual file.")
+}
+```
+
+```{r habitual-timing-check}
+# The moderator must be pre-treatment: it is constant within participant
+# across waves, whereas any experimental measure varies.
+hab_varying <- analysis_long %>%
+  group_by(pid) %>%
+  filter(n() > 1) %>%
+  summarise(hab_varies = n_distinct(hab_overall_dw_pc1) > 1,
+            exp_varies = n_distinct(exp_q_dur) > 1,
+            .groups = "drop")
+
+cat("Participants in >1 wave:", nrow(hab_varying), "\n")
+cat("Habitual measure varies within participant:",
+    sum(hab_varying$hab_varies), "(should be 0)\n")
+
+stopifnot(sum(hab_varying$hab_varies) == 0)
+```
+
+# Part 6: Derived Analysis Variables
+
+```{r derived-variables}
+analysis_long <- analysis_long %>%
+  mutate(
+    # Primary outcome: magnitude of updating (Sec. 3.7).
+    y_abs    = att_abs,
+    y_signed = att_signed,
+
+    # Primary effort measure (Eq. 3.2); duration and domains are supplementary.
+    effort_count = exp_topic_uptake_n,
+
+    # Primary exposure (Eq. 3.3, category set of Sec. 3.5).
+    q_primary = exp_q_dur,
+
+    # Treatment dummies for the ITT models (Eq. 4.2).
+    t_verbal = as.integer(group_f == "verbal"),
+    t_money  = as.integer(group_f == "monetary"),
+
+    # Median splits are computed within wave, since each wave has its own
+    # analytical sample.
+    across(all_of(paste0("hab_", DIET_VARIANTS, "_level_group")),
+    ~ factor(.x, levels = c("low", "high")))
+  )
+
+cat("Subgroup sizes by wave and diet definition:\n")
+map_dfr(DIET_VARIANTS, function(v) {
+  analysis_long %>%
+    count(wave, group = .data[[paste0("hab_", v, "_level_group")]]) %>%
+    mutate(variant = v)
+}) %>%
+  pivot_wider(names_from = group, values_from = n, values_fill = 0L) %>%
+  as.data.frame() %>% print()
+```
+
+# Part 7: Variable Roles
+
+Written out so that `03b` can assert on roles rather than on names, and so
+that the appendix table can be generated from the data rather than typed.
+
+```{r variable-roles}
+variable_roles <- tribble(
+  ~variable,                ~role,        ~timing,        ~note,
+  "group_f",                "treatment",  "randomised",   "Three-level assignment",
+  "z_verbal",               "instrument", "randomised",   "Verbal vs. control",
+  "z_money",                "instrument", "randomised",   "Monetary vs. control",
+  "y_abs",                  "outcome",    "post",         "Primary, |post - pre|",
+  "y_signed",               "outcome",    "post",         "Secondary, signed",
+  "kno_signed",             "outcome",    "post",         "Knowledge change",
+  "exp_topic_uptake_yn",    "uptake",     "experimental", "Eq. 3.1, complete",
+  "effort_count",           "effort",     "experimental", "Eq. 3.2, primary",
+  "topic_duration",         "effort",     "experimental", "Supplementary",
+  "n_topic_domains",        "effort",     "experimental", "Supplementary",
+  "q_primary",              "exposure",   "experimental", "Eq. 3.3, primary",
+  "exp_q_unw",              "exposure",   "experimental", "Eq. 3.4, sensitivity",
+  "exp_q_log",              "exposure",   "experimental", "Eq. 3.5, sensitivity",
+  "exp_q_dur_news",         "exposure",   "experimental", "News-only set, sensitivity",
+  "exp_q_dur_all",          "exposure",   "experimental", "Incl. search, sensitivity",
+  "hab_overall_level_group",        "moderator", "pre-treatment", "Median split",
+  "hab_news_level_group",           "moderator", "pre-treatment", "Median split",
+  "hab_news_corrected_level_group", "moderator", "pre-treatment", "Median split",
+  "att_baseline",           "covariate",  "pre",          "Wave-specific",
+  "prior_engagement",       "covariate",  "pre",          "Wave-specific",
+  "polknow_total",          "covariate",  "baseline",     "",
+  "pol_interest_general",   "covariate",  "baseline",     "",
+  "newsuse_online",         "covariate",  "baseline",     "0-8 days/week",
+  "edu_time",               "covariate",  "baseline",     "",
+  "age",                    "covariate",  "baseline",     "",
+  "gender_f",               "covariate",  "baseline",     "",
+  "nfc",                    "covariate",  "baseline",     "Sec. 4.10 sensitivity only"
+)
+
+missing_vars <- setdiff(variable_roles$variable, names(analysis_long))
+if (length(missing_vars) > 0) stop("Not in the dataset: ", paste(missing_vars, collapse = ", "))
+
+variable_roles %>% count(role) %>% as.data.frame() %>% print()
+write_csv(variable_roles, file.path(output_dir, "variable_roles.csv"))
+```
+
+# Part 8: Split and Save
+
+```{r save}
+analysis_data <- split(analysis_long, analysis_long$wave)
+names(analysis_data) <- paste0("wave", names(analysis_data))
+
+walk2(analysis_data, names(analysis_data), function(d, nm) {
+  write_csv(d, file.path(output_dir, paste0("analysis_data_", nm, ".csv")))
+})
+saveRDS(analysis_data, file.path(output_dir, "analysis_data_by_wave.Rds"))
+
+cat("Saved", length(analysis_data), "wave datasets:\n")
+imap(analysis_data, ~ cat("  ", .y, ":", nrow(.x), "rows,", ncol(.x), "columns\n")) %>% invisible()
+```

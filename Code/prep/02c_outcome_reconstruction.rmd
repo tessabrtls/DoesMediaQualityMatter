@@ -1,0 +1,307 @@
+---
+title: "Survey Outcomes: Attitude and Knowledge Change"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Rebuilds the outcome variables from the underlying survey items and
+verifies them against the supplied difference scores. Same rule as for
+uptake in `02b`: a supplied variable is not used in a model until its
+construction has been reproduced (Appendix A.2, A.4).
+
+Four stages:
+
+1. Identify the pre- and post-items and record their German wording
+2. Reconstruct signed and absolute attitude change (Eq. 3.7, 3.8)
+3. Compare against `gen_pol_attitude_topic_diff` and explain discrepancies
+4. Repeat for the knowledge outcome
+
+Everything is at `pid` x `wave`, restricted to the analysis samples, so the
+output joins directly onto the uptake and quality files from `02b`.
+
+## Outputs
+
+| Object | Role |
+|---|---|
+| `attitude_outcomes_by_wave.Rds` / `.csv` | Reconstructed outcomes at `pid` x `wave` |
+| `outcome_item_wording.csv` | German item wording and coding, for Appendix A.4 |
+| `outcome_reconstruction_check.csv` | Row-level comparison against the supplied variables |
+
+## Design choices
+
+| Choice | Rule | Reason |
+|---|---|---|
+| Primary outcome | absolute change | Hypotheses concern amount of updating, not direction (Sec. 3.7) |
+| Secondary outcome | signed change | Distinguishes movement towards from away from support |
+| Scale | 1--7, 4 = neutral | 1 = should not be introduced, 7 = should be introduced |
+| Reconstruction | from raw items | The supplied difference is verified, not assumed |
+| Sample | analysis samples only | Shares a denominator with the `02b` measures |
+
+# Part 1: Setup
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(purrr)
+```
+
+```{r, include=FALSE}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+data_dir     <- "~/Desktop/Masterarbeit/Data"
+```
+
+```{r paths-config}
+#project_root <- "DoesMediaQualityMatter"
+#data_dir     <- "Data"
+input_dir <- file.path(project_root, "Output", "00_setup")
+output_dir <- file.path(project_root, "Output", "02c_outcomes")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+load(file.path(data_dir, "df1_final_ac.Rdata"))
+load(file.path(data_dir, "df2_final_ac.Rdata"))
+load(file.path(data_dir, "df3_final_ac.Rdata"))
+
+waves <- list("1" = df1, "2" = df2, "3" = df3)
+
+wave_topics <- c("1" = "Basic child support",
+                 "2" = "Renewable-energy transition",
+                 "3" = "Cannabis legalisation")
+
+analysis_pids <- imap_dfr(waves, function(d, w) {
+  tibble(pid = as.character(d$pid), wave = as.integer(w))
+}) %>%
+  distinct(pid, wave)
+
+cat("Analysis participant-waves:", nrow(analysis_pids), "\n")
+analysis_pids %>% count(wave, name = "n") %>% print()
+```
+
+# Part 2: Identifying the Items
+
+Run this first. The value range separates the 1--7 attitude items from
+derived scores that share part of the name.
+
+```{r item-discovery}
+candidates <- imap_dfr(waves, function(d, w) {
+  tibble(wave = as.integer(w), var = names(d)) %>%
+    filter(str_detect(var, regex("attitude|einstellung|pol_att|knowledge|wissen",
+                                 ignore_case = TRUE)))
+})
+
+cat("Outcome-related columns per wave:\n")
+candidates %>% count(wave, var) %>% print(n = Inf)
+
+cat("\nRange and type of each candidate:\n")
+imap_dfr(waves, function(d, w) {
+  vars <- candidates$var[candidates$wave == as.integer(w)]
+  tibble(wave = as.integer(w), var = vars) %>%
+    mutate(info = map_chr(vars, function(v) {
+      x <- d[[v]]
+      if (!is.numeric(x)) return(paste0("non-numeric (", class(x)[1], ")"))
+      sprintf("%.2f to %.2f | %d distinct | %d NA",
+              min(x, na.rm = TRUE), max(x, na.rm = TRUE),
+              n_distinct(x, na.rm = TRUE), sum(is.na(x)))
+    }))
+}) %>%
+  as.data.frame() %>% print()
+```
+
+The lookup sheets carry the German wording required by Appendix A.4.
+
+
+# Part 3: Reconstruction
+
+Fill in the item names identified in Part 2.
+
+```{r item-config}
+OUTCOME_ITEMS <- tribble(
+  ~wave, ~att_pre,                     ~att_post,                     ~kno_pre,            ~kno_post,
+  1L,    "gen_pol_attitude_topic_pre", "gen_pol_attitude_topic_post", "gen_knowledge_pre", "gen_knowledge_post",
+  2L,    "gen_pol_attitude_topic_pre", "gen_pol_attitude_topic_post", "gen_knowledge_pre", "gen_knowledge_post",
+  3L,    "gen_pol_attitude_topic_pre", "gen_pol_attitude_topic_post", "gen_knowledge_pre", "gen_knowledge_post"
+)
+
+# Fail early with a readable message rather than inside pmap.
+walk2(OUTCOME_ITEMS$wave,
+      asplit(as.matrix(OUTCOME_ITEMS[-1]), 1),
+      function(w, items) {
+        missing <- setdiff(items, names(waves[[as.character(w)]]))
+        if (length(missing) > 0)
+          stop("Wave ", w, ": columns not found -- ", paste(missing, collapse = ", "))
+      })
+```
+
+```{r reconstruct-outcomes}
+# The wave files are haven-labelled, and the label attributes differ across
+# waves, so stacking them fails. unclass() strips the class, as.numeric()
+# the remaining attributes. The German wording is documented separately (A.4).
+num <- function(x) as.numeric(unclass(x))
+
+outcomes <- pmap_dfr(OUTCOME_ITEMS, function(wave, att_pre, att_post, kno_pre, kno_post) {
+  d <- waves[[as.character(wave)]]
+  tibble(
+    pid      = as.character(d$pid),
+    wave     = wave,
+    att_pre  = num(d[[att_pre]]),
+    att_post = num(d[[att_post]]),
+    kno_pre  = num(d[[kno_pre]]),
+    kno_post = num(d[[kno_post]]),
+    supplied_att     = num(d$gen_pol_attitude_topic_diff),
+    supplied_kno     = num(d$gen_knowledge_diff),
+    # Candidate absolute measure: no *_diff_abs column exists in the wave
+    # files, so the absolute outcome used so far was derived in 03a.
+    supplied_att_chg = num(d$gen_pol_attitude_topic_change_diff),
+    att_pre_change   = num(d$gen_pol_attitude_topic_pre_change),
+    att_post_change  = num(d$gen_pol_attitude_topic_post_change)
+  )
+}) %>%
+  mutate(att_signed = att_post - att_pre,
+         att_abs    = abs(att_post - att_pre),
+         kno_signed = kno_post - kno_pre)
+
+stopifnot(all(is.na(outcomes$att_pre)  | between(outcomes$att_pre,  1, 7)))
+stopifnot(all(is.na(outcomes$att_post) | between(outcomes$att_post, 1, 7)))
+stopifnot(nrow(outcomes) == nrow(analysis_pids))
+
+cat("Reconstructed outcomes for", nrow(outcomes), "participant-waves\n")
+```
+
+
+```{r clarify-second-item-family}
+# Two attitude item families exist. Establish which one the supplied
+# difference is built from before either is used as the outcome.
+cat("Do the two families hold the same values?\n")
+outcomes %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            pre_identical  = round(100 * mean(att_pre  == att_pre_change,  na.rm = TRUE), 1),
+            post_identical = round(100 * mean(att_post == att_post_change, na.rm = TRUE), 1),
+            r_pre  = round(cor(att_pre,  att_pre_change,  use = "complete.obs"), 3),
+            r_post = round(cor(att_post, att_post_change, use = "complete.obs"), 3),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+
+cat("\nIs gen_pol_attitude_topic_change_diff the absolute difference?\n")
+outcomes %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            matches_abs_of_main = round(100 * mean(supplied_att_chg == att_abs, na.rm = TRUE), 1),
+            matches_abs_of_chg  = round(100 * mean(
+              supplied_att_chg == abs(att_post_change - att_pre_change), na.rm = TRUE), 1),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+# Part 4: Comparison Against the Supplied Variables
+
+```{r comparison-attitude}
+compare_one <- function(df, recon_var, supplied_var, label) {
+  df %>%
+    filter(!is.na(.data[[recon_var]]), !is.na(.data[[supplied_var]])) %>%
+    group_by(wave) %>%
+    summarise(n             = n(),
+              pct_identical = round(100 * mean(.data[[recon_var]] == .data[[supplied_var]]), 1),
+              max_abs_diff  = max(abs(.data[[recon_var]] - .data[[supplied_var]])),
+              r             = round(cor(.data[[recon_var]], .data[[supplied_var]]), 4),
+              .groups = "drop") %>%
+    mutate(outcome = label)
+}
+
+bind_rows(
+  compare_one(outcomes, "att_signed", "supplied_att",     "attitude, signed"),
+  compare_one(outcomes, "att_abs",    "supplied_att_chg", "attitude, absolute (candidate)"),
+  compare_one(outcomes, "kno_signed", "supplied_kno",     "knowledge, signed")
+)%>%
+  select(outcome, wave, n, pct_identical, max_abs_diff, r) %>%
+  as.data.frame() %>% print()
+```
+
+Missingness is checked in both directions. Cases where the supplied
+variable exists but the items do not would mean the reconstruction is
+incomplete rather than merely different.
+
+```{r comparison-missingness}
+outcomes %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            items_only    = sum(!is.na(att_signed) & is.na(supplied_att)),
+            supplied_only = sum(is.na(att_signed) & !is.na(supplied_att)),
+            both          = sum(!is.na(att_signed) & !is.na(supplied_att)),
+            neither       = sum(is.na(att_signed) & is.na(supplied_att)),
+            .groups = "drop") %>%
+  as.data.frame() %>% print()
+```
+
+Appendix A.4 requires discrepancies to be explained. A constant gap points
+at a sign convention or a reversed item; a varying gap points at a
+different pre-measure, for example a baseline taken from T0 rather than
+from the wave's own pre-questionnaire.
+
+```{r comparison-discrepancies}
+mismatches <- outcomes %>%
+  filter(!is.na(att_signed), !is.na(supplied_att), att_signed != supplied_att)
+
+cat("Mismatching attitude cases:", nrow(mismatches), "\n")
+
+if (nrow(mismatches) > 0) {
+  cat("\nDistribution of the gap (reconstructed minus supplied):\n")
+  print(table(mismatches$att_signed - mismatches$supplied_att))
+
+  cat("\nMost frequent mismatch patterns:\n")
+  mismatches %>%
+    count(wave, att_pre, att_post, att_signed, supplied_att, sort = TRUE) %>%
+    head(20) %>% as.data.frame() %>% print()
+}
+```
+
+```{r outcome-distributions}
+cat("Distribution of reconstructed signed attitude change:\n")
+outcomes %>%
+  filter(!is.na(att_signed)) %>%
+  count(wave, att_signed) %>%
+  pivot_wider(names_from = wave, values_from = n,
+              names_prefix = "wave_", values_fill = 0L) %>%
+  arrange(att_signed) %>%
+  as.data.frame() %>% print()
+
+cat("\nSummary by wave:\n")
+outcomes %>%
+  filter(!is.na(att_signed)) %>%
+  group_by(wave) %>%
+  summarise(n = n(),
+            mean_pre    = round(mean(att_pre), 2),
+            mean_post   = round(mean(att_post), 2),
+            mean_signed = round(mean(att_signed), 3),
+            mean_abs    = round(mean(att_abs), 3),
+            pct_no_change = round(100 * mean(att_signed == 0), 1),
+            .groups = "drop") %>%
+  mutate(topic = wave_topics[as.character(wave)]) %>%
+  as.data.frame() %>% print()
+```
+
+# Part 5: Saving
+
+```{r save}
+write_csv(outcomes, file.path(output_dir, "outcome_reconstruction_check.csv"))
+
+outcomes_final <- outcomes %>%
+  select(pid, wave, att_pre, att_post, att_signed, att_abs, kno_pre, kno_post, kno_signed)
+
+saveRDS(outcomes_final, file.path(output_dir, "attitude_outcomes_by_wave.Rds"))
+write_csv(outcomes_final, file.path(output_dir, "attitude_outcomes_by_wave.csv"))
+
+cat("Saved", nrow(outcomes_final), "participant-waves\n")
+```

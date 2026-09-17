@@ -1,0 +1,37 @@
+Topic,Variant,Arm,Term,Estimate,SE,CI low,CI high,p,Sig,N,adj. R2
+Cannabis,news,Monetary,Low group,0.017,0.165,-0.307,0.341,0.92,,468,0.023
+Cannabis,news,Monetary,Interaction,0.379,0.232,-0.077,0.835,0.103,,468,0.023
+Cannabis,news,Verbal,Low group,0.177,0.159,-0.135,0.489,0.265,,468,0.023
+Cannabis,news,Verbal,Interaction,0.118,0.226,-0.327,0.563,0.603,,468,0.023
+Cannabis,news_corrected,Monetary,Low group,0.139,0.152,-0.16,0.438,0.362,,536,0.019
+Cannabis,news_corrected,Monetary,Interaction,0.133,0.214,-0.288,0.553,0.536,,536,0.019
+Cannabis,news_corrected,Verbal,Low group,0.291,0.15,-0.003,0.585,0.052,+,536,0.019
+Cannabis,news_corrected,Verbal,Interaction,-0.222,0.21,-0.635,0.19,0.291,,536,0.019
+Cannabis,overall,Monetary,Low group,0.356,0.146,0.07,0.643,0.015,*,554,0.02
+Cannabis,overall,Monetary,Interaction,-0.316,0.209,-0.728,0.095,0.131,,554,0.02
+Cannabis,overall,Verbal,Low group,0.178,0.146,-0.108,0.464,0.221,,554,0.02
+Cannabis,overall,Verbal,Interaction,-0.044,0.207,-0.451,0.363,0.832,,554,0.02
+Child support,news,Monetary,Low group,0.482,0.16,0.169,0.796,0.003,**,465,0.057
+Child support,news,Monetary,Interaction,-0.485,0.225,-0.927,-0.044,0.031,*,465,0.057
+Child support,news,Verbal,Low group,0.233,0.16,-0.082,0.549,0.147,,465,0.057
+Child support,news,Verbal,Interaction,-0.572,0.234,-1.031,-0.113,0.015,*,465,0.057
+Child support,news_corrected,Monetary,Low group,0.408,0.153,0.106,0.709,0.008,**,528,0.041
+Child support,news_corrected,Monetary,Interaction,-0.331,0.213,-0.75,0.088,0.121,,528,0.041
+Child support,news_corrected,Verbal,Low group,0.236,0.159,-0.077,0.549,0.14,,528,0.041
+Child support,news_corrected,Verbal,Interaction,-0.402,0.222,-0.838,0.033,0.07,+,528,0.041
+Child support,overall,Monetary,Low group,0.236,0.147,-0.052,0.525,0.108,,547,0.049
+Child support,overall,Monetary,Interaction,-0.007,0.208,-0.417,0.402,0.971,,547,0.049
+Child support,overall,Verbal,Low group,0.193,0.153,-0.108,0.493,0.209,,547,0.049
+Child support,overall,Verbal,Interaction,-0.365,0.22,-0.797,0.068,0.098,+,547,0.049
+Energy transition,news,Monetary,Low group,-0.071,0.167,-0.399,0.257,0.672,,467,0.053
+Energy transition,news,Monetary,Interaction,0.176,0.229,-0.274,0.627,0.442,,467,0.053
+Energy transition,news,Verbal,Low group,-0.064,0.156,-0.371,0.243,0.682,,467,0.053
+Energy transition,news,Verbal,Interaction,-0.043,0.226,-0.488,0.402,0.85,,467,0.053
+Energy transition,news_corrected,Monetary,Low group,0.091,0.149,-0.201,0.383,0.541,,531,0.041
+Energy transition,news_corrected,Monetary,Interaction,-0.169,0.213,-0.587,0.25,0.429,,531,0.041
+Energy transition,news_corrected,Verbal,Low group,0.095,0.148,-0.196,0.387,0.52,,531,0.041
+Energy transition,news_corrected,Verbal,Interaction,-0.35,0.21,-0.763,0.063,0.096,+,531,0.041
+Energy transition,overall,Monetary,Low group,0.115,0.144,-0.168,0.399,0.425,,549,0.039
+Energy transition,overall,Monetary,Interaction,-0.225,0.209,-0.636,0.185,0.281,,549,0.039
+Energy transition,overall,Verbal,Low group,0.041,0.142,-0.237,0.32,0.772,,549,0.039
+Energy transition,overall,Verbal,Interaction,-0.226,0.206,-0.63,0.178,0.273,,549,0.039

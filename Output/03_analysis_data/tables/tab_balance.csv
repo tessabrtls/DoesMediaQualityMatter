@@ -1,0 +1,25 @@
+Topic,Variable,control,verbal,monetary,p
+Child support,age,49.212,49.585,48.138,0.464
+Child support,att_baseline,4.995,4.835,4.866,0.636
+Child support,edu_time,14.332,14.403,14.433,0.965
+Child support,hab_overall_dw_pc1,0.63,0.627,0.634,0.798
+Child support,newsuse_online,4.917,4.511,4.631,0.365
+Child support,pol_interest_general,3.482,3.369,3.488,0.501
+Child support,polknow_total,0.615,0.577,0.595,0.229
+Child support,prior_engagement,0.351,0.251,0.257,0.059
+Energy transition,age,48.072,49.29,49.268,0.526
+Energy transition,att_baseline,5.289,5.271,5.337,0.916
+Energy transition,edu_time,14.309,14.262,14.563,0.686
+Energy transition,hab_overall_dw_pc1,0.622,0.634,0.641,0.229
+Energy transition,newsuse_online,4.588,4.78,4.926,0.495
+Energy transition,pol_interest_general,3.356,3.388,3.547,0.175
+Energy transition,polknow_total,0.613,0.595,0.607,0.655
+Energy transition,prior_engagement,0.535,0.556,0.505,0.615
+Cannabis,age,48.043,49.464,49.172,0.454
+Cannabis,att_baseline,3.918,4.01,4.198,0.419
+Cannabis,edu_time,14.266,14.357,14.5,0.818
+Cannabis,hab_overall_dw_pc1,0.628,0.633,0.638,0.624
+Cannabis,newsuse_online,4.783,4.686,4.724,0.941
+Cannabis,pol_interest_general,3.386,3.367,3.453,0.713
+Cannabis,polknow_total,0.605,0.589,0.593,0.723
+Cannabis,prior_engagement,0.411,0.421,0.35,0.321

@@ -1,0 +1,425 @@
+---
+title: "Visit Periods, Treatment Group, and Domain Categories"
+author: "Master's Thesis -- Media Quality / Media Diet"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = TRUE)
+```
+
+# Overview
+
+One continuous transformation of the reduced `visits_raw` table: first
+adding a parsed timestamp, treatment group, and person-specific period
+label (Part 1), then domain/app categories plus a unified `is_news` flag
+(Part 2). Part 2 requires the exact columns Part 1 produces, so the two are
+not useful read in isolation.
+
+## Outputs
+
+| Object | New columns |
+|---|---|
+| `visits_raw_period.Rds` / `.RData` | `used_at_dt`, `used_date`, `group`, `period` |
+| `visits_raw_period_categories.Rds` / `.RData` | `category_1`, `category_2`, `category_3`, `app_cat`, `is_news` |
+
+## Why period is person-specific, not calendar-fixed
+
+A shared calendar boundary for all participants would mislabel `pre`,
+`during`, or `post` for many people, since they joined the study at
+different points and some skipped a wave entirely. `period` is therefore
+defined relative to *that specific person's own* `survey_start`/
+`survey_end` in each wave they took part in.
+
+| Period label | Meaning |
+|---|---|
+| `pre` | Before this person's first `survey_start`, across all waves they joined |
+| `during_w1` / `during_w2` / `during_w3` | Within that wave's `[survey_start, survey_end]` window |
+| `between_1_2` / `between_2_3` | Gap between two consecutive waves this person took part in |
+| `between_1_3` | Gap between Wave 1 and Wave 3, for someone who skipped Wave 2 |
+| `post` | After this person's last `survey_end`, across all waves they joined |
+| `NA` | No wave participation at all (February-only baseline participant) |
+
+# Part 1: Adding Group and Period
+
+## Setup
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(readr)
+library(stringr)
+library(purrr)
+```
+
+```{r paths-and-helper, include=FALSE}
+project_root <- "~/Desktop/GitHub/DoesMediaQualityMatter"
+data_dir <- "~/Desktop/Masterarbeit/Data"
+
+save_both <- function(obj, name, dir = output_dir) {
+  assign(name, obj)
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  save(list = name, file = file.path(dir, paste0(name, ".RData")))
+  message("Saved ", name)
+}
+```
+
+
+```{r}
+#project_root <- "DoesMediaQualityMatter"
+code_dir <- file.path(project_root, "Code", "prep")
+pid_dir <- file.path(project_root, "Output", "00_setup")
+output_dir <- file.path(project_root, "Output", "01_visits")
+#data_dir <- ""
+
+# Saves as .Rds (readRDS() reuse) and .RData (load()
+save_both <- function(obj, name, dir = output_dir) {
+  assign(name, obj)
+  saveRDS(obj, file.path(dir, paste0(name, ".Rds")))
+  save(list = name, file = file.path(dir, paste0(name, ".RData")))
+  message("Saved ", name)
+}
+
+```
+
+## Loading inputs
+
+Loads `visits_raw`, the participant lookup, and the three wave-level
+dataframes, needed here purely to recover each person's survey timing.
+
+```{r load-inputs, include=FALSE}
+visits_raw <- readRDS(file.path(output_dir, "visits_raw.Rds"))
+pid_lookup_february <- readRDS(file.path(pid_dir, "pid_lookup_february.Rds")) %>%
+  mutate(pid = as.character(pid))
+
+if (!"group" %in% names(pid_lookup_february)) {
+  stop("pid_lookup_february is missing the 'group' column. Add it first.")
+}
+
+load(file.path(data_dir, "df1_final_ac.Rdata")) # creates df1
+load(file.path(data_dir, "df2_final_ac.Rdata")) # creates df2
+load(file.path(data_dir, "df3_final_ac.Rdata")) # creates df3
+
+df1 <- df1 %>% mutate(pid = as.character(pid))
+df2 <- df2 %>% mutate(pid = as.character(pid))
+df3 <- df3 %>% mutate(pid = as.character(pid))
+```
+
+## Parsing `used_at` into a proper local timestamp
+
+`used_at` is already local (Europe/Berlin) clock time as a plain character
+string, so it is parsed directly with `tz = "Europe/Berlin"`, no
+timezone-shift correction needed.
+
+```{r parse-used-at}
+visits_raw <- visits_raw %>%
+  mutate(
+    used_at_dt = as.POSIXct(used_at, format = "%Y-%m-%d %H:%M:%S", tz = "Europe/Berlin"),
+    used_date = as.Date(used_at_dt)
+  )
+```
+
+## Handling the daylight-saving-time gap
+
+Clocks jumped forward on 26 March 2023, so any timestamp in the
+non-existent 02:00 to 03:00 window fails to parse and becomes `NA`. Those
+rows are snapped to the moment clocks resumed (03:00:00), consistent with
+earlier handling in the pipeline, rather than dropped outright.
+
+```{r dst-fix}
+visits_raw <- visits_raw %>%
+  mutate(
+    dst_problem = is.na(used_at_dt) & grepl("^2023-03-26", used_at),
+    used_at_dt = case_when(
+      dst_problem ~ as.POSIXct("2023-03-26 03:00:00", tz = "Europe/Berlin"),
+      TRUE ~ used_at_dt
+    ),
+    used_date = case_when(
+      dst_problem ~ as.Date("2023-03-26"),
+      TRUE ~ used_date
+    )
+  )
+
+cat("Rows with unparseable used_at (dropped):", sum(is.na(visits_raw$used_at_dt)), "\n")
+visits_raw <- visits_raw %>% filter(!is.na(used_at_dt))
+```
+
+## Parsing each wave's survey window
+
+Waves 1 and 3 store `start_date`/`final_date` as character timestamps. Wave 2 stores them as Excel-style numeric day counts, needing a separate numeric-to-POSIXct conversion via the Excel epoch (`"1899-12-30"`). Here I need to use the wave specific files, because they contain the survey start and end times.
+
+```{r parse-survey-windows}
+df1 <- df1 %>%
+  mutate(
+    survey_start = as.POSIXct(start_date, format = "%Y-%m-%d %H:%M:%S", tz = "Europe/Berlin"),
+    survey_end   = as.POSIXct(final_date, format = "%Y-%m-%d %H:%M:%S", tz = "Europe/Berlin")
+  )
+
+df2 <- df2 %>%
+  mutate(
+    start_date_num = as.numeric(start_date),
+    final_date_num = as.numeric(final_date),
+    survey_start = as.POSIXct(start_date_num * 86400, origin = "1899-12-30", tz = "Europe/Berlin"),
+    survey_end   = as.POSIXct(final_date_num * 86400, origin = "1899-12-30", tz = "Europe/Berlin")
+  ) %>%
+  select(-start_date_num, -final_date_num)
+
+df3 <- df3 %>%
+  mutate(
+    survey_start = as.POSIXct(start_date, format = "%Y-%m-%d %H:%M:%S", tz = "Europe/Berlin"),
+    survey_end   = as.POSIXct(final_date, format = "%Y-%m-%d %H:%M:%S", tz = "Europe/Berlin")
+  )
+```
+
+## Building per-participant, per-wave survey windows
+
+All three waves' windows are stacked into one long table first, checked
+for logically invalid windows (`survey_start > survey_end`, which should
+never happen), then reshaped to wide (one row per participant) before
+joining to `visits_raw`. Reshaping to wide first keeps the later join to
+the much larger visits table strictly one-to-one, so no visit row can be
+duplicated by a many-to-many join on `pid`.
+
+```{r build-windows}
+pid_wave_windows <- bind_rows(
+  df1 %>% distinct(pid, survey_start, survey_end) %>% mutate(wave = 1L),
+  df2 %>% distinct(pid, survey_start, survey_end) %>% mutate(wave = 2L),
+  df3 %>% distinct(pid, survey_start, survey_end) %>% mutate(wave = 3L)
+) %>%
+  filter(!is.na(survey_start), !is.na(survey_end)) %>%
+  arrange(pid, survey_start)
+
+cat("Rows in pid_wave_windows:", nrow(pid_wave_windows), "\n")
+cat("Unique pids with at least one survey window:", n_distinct(pid_wave_windows$pid), "\n")
+
+invalid_windows <- pid_wave_windows %>% filter(survey_start > survey_end)
+cat("Rows with survey_start > survey_end (should be 0):", nrow(invalid_windows), "\n")
+
+pid_period_boundaries <- pid_wave_windows %>%
+  group_by(pid) %>%
+  summarise(
+    first_survey_start = min(survey_start),
+    last_survey_end = max(survey_end),
+    .groups = "drop"
+  )
+
+pid_wave_wide <- pid_wave_windows %>%
+  select(pid, wave, survey_start, survey_end) %>%
+  pivot_wider(
+    id_cols = pid,
+    names_from = wave,
+    values_from = c(survey_start, survey_end),
+    names_glue = "w{wave}_{.value}"
+  )
+```
+
+## Adding group and classifying each visit into a period
+
+```{r add-group-and-period}
+n_before <- nrow(visits_raw)
+
+visits_raw <- visits_raw %>%
+  left_join(pid_lookup_february %>% select(pid, group), by = "pid") %>%
+  left_join(pid_period_boundaries, by = "pid") %>%
+  left_join(pid_wave_wide, by = "pid") %>%
+  mutate(
+    period = case_when(
+      is.na(first_survey_start) ~ NA_character_,
+
+      used_at_dt < first_survey_start ~ "pre",
+
+      !is.na(w1_survey_start) & used_at_dt >= w1_survey_start & used_at_dt <= w1_survey_end ~ "during_w1",
+      !is.na(w2_survey_start) & used_at_dt >= w2_survey_start & used_at_dt <= w2_survey_end ~ "during_w2",
+      !is.na(w3_survey_start) & used_at_dt >= w3_survey_start & used_at_dt <= w3_survey_end ~ "during_w3",
+
+      !is.na(w1_survey_end) & !is.na(w2_survey_start) &
+        used_at_dt > w1_survey_end & used_at_dt < w2_survey_start ~ "between_1_2",
+      !is.na(w2_survey_end) & !is.na(w3_survey_start) &
+        used_at_dt > w2_survey_end & used_at_dt < w3_survey_start ~ "between_2_3",
+      !is.na(w1_survey_end) & is.na(w2_survey_start) & !is.na(w3_survey_start) &
+        used_at_dt > w1_survey_end & used_at_dt < w3_survey_start ~ "between_1_3",
+
+      used_at_dt > last_survey_end ~ "post",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-starts_with("w1_"), -starts_with("w2_"), -starts_with("w3_"),
+         -first_survey_start, -last_survey_end, -dst_problem)
+
+cat("Rows before vs. after period/group join (should match):", n_before, "vs.", nrow(visits_raw), "\n")
+cat("Distribution of period:\n")
+print(table(visits_raw$period, useNA = "ifany"))
+cat("Distribution of group:\n")
+print(table(visits_raw$group, useNA = "ifany"))
+```
+
+## Saving
+
+```{r save-period , eval=FALSE }
+glimpse(visits_raw)
+save_both(visits_raw, "visits_raw_period")
+```
+
+# Part 2: Adding Domain and App Categories
+
+```{r}
+visits_raw_period <- visits_raw
+```
+
+## Reading and cleaning domain categories
+
+Category files can list up to three comma-separated category labels per
+domain, split here into three separate columns, with a small set of known
+label corrections (typos and inconsistent naming across export batches).
+
+```{r read-categories, include=FALSE}
+category_paths <- c(
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-04-01-to-2023-04-15-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/fixed/2023-04-15-to-2023-05-01-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-05-01-to-2023-05-15-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-05-15-to-2023-06-01-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-06-01-to-2023-06-15-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-06-15-to-2023-07-01-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-07-01-to-2023-07-15-exports/categories.csv",
+  "/Users/e/Desktop/Masterarbeit/Data/download-2/original/2023-07-15-to-2023-08-01-exports/categories.csv"
+) |> unique()
+```
+
+```{r read-categories-fn, include=FALSE}
+read_category_file <- function(path) {
+  message("Reading category file.")
+  tryCatch({
+    tmp <- read_delim(path, delim = ",", col_names = c("domain", "category"),
+                       show_col_types = FALSE, progress = FALSE)
+    if (ncol(tmp) == 1) {
+      tmp <- read_delim(path, delim = ";", col_names = c("domain", "category"),
+                         show_col_types = FALSE, progress = FALSE)
+    }
+    tmp
+  }, error = function(e) {
+    read_delim(path, delim = ";", col_names = c("domain", "category"),
+               show_col_types = FALSE, progress = FALSE)
+  })
+}
+
+categories_raw <- map_dfr(category_paths, read_category_file)
+
+categories_final <- categories_raw %>%
+  mutate(domain = as.character(domain), category = as.character(category)) %>%
+  filter(!is.na(domain), domain != "") %>%
+  distinct(domain, category, .keep_all = TRUE) %>%
+  separate(category, into = c("category_1", "category_2", "category_3"),
+           sep = ",", extra = "drop", fill = "right") %>%
+  mutate(across(starts_with("category_"), str_trim))
+
+category_corrections <- c(
+  "sport" = "sports",
+  "newsandmedi" = "newsandmedia",
+  "food" = "foodandrecipes",
+  "foodfoodandrecipes" = "foodandrecipes"
+)
+
+recode_category <- function(x) {
+  recoded <- category_corrections[x]
+  ifelse(is.na(recoded), x, recoded)
+}
+
+categories_final <- categories_final %>%
+  mutate(
+    category_1 = recode_category(category_1),
+    category_2 = recode_category(category_2),
+    category_3 = recode_category(category_3)
+  )
+
+cat("Rows in categories_final (unique domains):", nrow(categories_final), "\n")
+```
+
+## Merging domain categories
+
+Join key is `content_id = domain`, so this only affects `visit_type` 0
+(web) and 1 (mobile web) rows. App visits (`visit_type == 2`) get their
+categories from a separate lookup next.
+
+```{r merge-domain-categories}
+n_before <- nrow(visits_raw_period)
+
+visits_raw_period <- visits_raw_period %>%
+  left_join(
+    categories_final %>% select(domain, category_1, category_2, category_3),
+    by = c("content_id" = "domain")
+  )
+
+cat("Rows before vs. after domain category join (should match):", n_before, "vs.", nrow(visits_raw_period), "\n")
+cat("visit_type 0/1 rows with no category match:",
+    sum(visits_raw_period$visit_type %in% c(0L, 1L) & is.na(visits_raw_period$category_1)), "\n")
+```
+
+## Merging app categories
+
+`app_cat` already exists inside the `app_visits` table. A small distinct
+lookup is re-derived from it here rather than depending on that object
+still being loaded in the current session, keeping this step runnable on
+its own as long as `app_visits.Rds` exists on disk.
+
+```{r merge-app-categories, include=FALSE}
+app_visits_path <- file.path(output_dir, "app_visits.Rds")
+if (!file.exists(app_visits_path)) {
+  stop("app_visits.Rds not found at ", app_visits_path, ". Build it first.")
+}
+```
+
+```{r merge-app-categories-run}
+app_cat_lookup <- readRDS(app_visits_path) %>%
+  mutate(app_id = as.character(app_id)) %>%
+  distinct(app_id, app_cat)
+
+visits_raw_period <- visits_raw_period %>%
+  left_join(app_cat_lookup, by = c("content_id" = "app_id"))
+
+cat("visit_type == 2 rows with no app_cat match:",
+    sum(visits_raw_period$visit_type == 2L & is.na(visits_raw_period$app_cat)), "\n")
+```
+
+## Building a unified `is_news` flag
+
+Bridges two structurally different category vocabularies, Webshrinker's
+domain categories and the app-store category labels, but only for this
+single boolean, not for the underlying category systems themselves.
+`category_1`/`category_2`/`category_3` and `app_cat` stay as two separate,
+un-harmonised vocabularies; `is_news` is the only variable meant to be
+comparable across all three `visit_type` values.
+
+```{r is-news-flag}
+visits_raw_period <- visits_raw_period %>%
+  mutate(
+    is_news_domain = visit_type %in% c(0L, 1L) & (
+      category_1 == "newsandmedia" |
+      category_2 == "newsandmedia" |
+      category_3 == "newsandmedia"
+    ),
+    is_news_app = visit_type == 2L & str_detect(
+      app_cat,
+      regex("^News,\\s*Media\\s*&\\s*Publications$", ignore_case = TRUE)
+    ),
+    is_news = coalesce(is_news_domain, FALSE) | coalesce(is_news_app, FALSE)
+  ) %>%
+  select(-is_news_domain, -is_news_app)
+
+cat("Distribution of is_news by visit_type:\n")
+print(table(visits_raw_period$visit_type, visits_raw_period$is_news, useNA = "ifany"))
+```
+
+
+## Saving
+
+```{r save-categories}
+glimpse(visits_raw_period)
+save_both(visits_raw_period, "visits_raw_period_categories")
+```
+

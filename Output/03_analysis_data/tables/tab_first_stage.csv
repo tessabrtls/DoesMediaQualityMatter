@@ -1,0 +1,7 @@
+Topic,Arm,Estimate,SE,CI low,CI high,p,Sig,N,adj. R2
+Cannabis,Monetary,0.243,0.037,0.17,0.316,0,***,606,0.066
+Cannabis,Verbal,0.159,0.037,0.088,0.231,0,***,606,0.066
+Child support,Monetary,0.367,0.04,0.288,0.446,0,***,586,0.122
+Child support,Verbal,0.193,0.042,0.11,0.276,0,***,586,0.122
+Energy transition,Monetary,0.265,0.04,0.187,0.343,0,***,598,0.066
+Energy transition,Verbal,0.133,0.039,0.058,0.209,0.001,***,598,0.066

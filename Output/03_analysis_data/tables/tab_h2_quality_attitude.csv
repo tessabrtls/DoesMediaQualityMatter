@@ -1,0 +1,10 @@
+Topic,Model,Estimate,SE,CI low,CI high,p,Sig,N,adj. R2
+Cannabis,"1 Unadjusted, full",0.408,0.96,-1.501,2.318,0.672,,85,-0.002
+Cannabis,"2 Unadjusted, cc",0.481,1.037,-1.586,2.549,0.644,,76,-0.019
+Cannabis,3 Adjusted,0.234,1.142,-2.046,2.515,0.838,,76,0.002
+Child support,"1 Unadjusted, full",1.362,0.776,-0.181,2.904,0.083,+,89,0.013
+Child support,"2 Unadjusted, cc",1.238,0.818,-0.391,2.867,0.134,,81,0.006
+Child support,3 Adjusted,1.095,0.759,-0.418,2.609,0.153,,81,0.172
+Energy transition,"1 Unadjusted, full",-0.612,1.45,-3.637,2.414,0.678,,24,0.071
+Energy transition,"2 Unadjusted, cc",2.899,1.975,-1.25,7.049,0.159,,22,0.115
+Energy transition,3 Adjusted,5.209,3.248,-2.028,12.446,0.14,,22,-0.325

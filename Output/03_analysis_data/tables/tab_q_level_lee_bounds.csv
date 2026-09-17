@@ -1,0 +1,4 @@
+Topic,Trim share,Naive diff,Bound low,Bound high,Boot. low,Boot. high,N,N trimmed
+Child support,0.965,0.063,-0.159,0.231,-0.227,0.236,64,2
+Energy transition,0.849,0.006,-0.242,0.105,-0.354,0.105,13,1
+Cannabis,0.876,0.072,-0.112,0.279,-0.204,0.359,45,5

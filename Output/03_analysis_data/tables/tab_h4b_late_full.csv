@@ -1,0 +1,4 @@
+Topic,Estimate,SE,p,Sig,N,First-stage F
+Child support,0.636,0.295,0.032,*,558,39.03
+Energy transition,0.042,0.393,0.915,,565,20.98
+Cannabis,0.859,0.436,0.05,*,567,22.03

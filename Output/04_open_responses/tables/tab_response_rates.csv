@@ -1,0 +1,13 @@
+Topic,Wave,Arm,N,Answered,Rate
+Cannabis,post,Control,207,158,76.3
+Cannabis,pre,Control,207,163,78.7
+Cannabis,post,Monetary,192,165,85.9
+Cannabis,pre,Monetary,192,150,78.1
+Cannabis,post,Verbal,207,187,90.3
+Cannabis,pre,Verbal,207,168,81.2
+Child support,post,Control,193,151,78.2
+Child support,pre,Control,193,143,74.1
+Child support,post,Monetary,217,196,90.3
+Child support,pre,Monetary,217,146,67.3
+Child support,post,Verbal,176,156,88.6
+Child support,pre,Verbal,176,119,67.6

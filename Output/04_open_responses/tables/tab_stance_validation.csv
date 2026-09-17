@@ -1,0 +1,5 @@
+Model,Topic,N,r
+gbert,Child support,408,0.436
+gbert,Cannabis,481,0.65
+mdeberta,Child support,408,0.443
+mdeberta,Cannabis,481,0.63
